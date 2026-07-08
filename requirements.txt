@@ -1,0 +1,8 @@
+safetensors
+torch
+numpy
+transformers
+accelerate
+pytest
+asyncio
+pytest-asyncio
