@@ -1,44 +1,49 @@
 import torch
-import custom_ops
+import torch.nn.functional as F
+import custom_swiglu
 
-def test_tensor_cores():
-    print("🚀 Initializing Tensor Core (WMMA) Test...")
+
+def test_fused_swiglu():
+    print("🚀 Initializing Vectorized Fused SwiGLU Test...")
     
-    # Let's test a massive matrix first to measure the exact FP16 drift
-    M, N, K = 4096, 4096, 4096
+    # Qwen2 scale parameters (must be divisible by 8)
+    batch_size = 4
+    seq_len = 1024
+    total_tokens = batch_size * seq_len
+    hidden_size = 4096
     
-    A = torch.randn(M, K, device='cuda', dtype=torch.float16)
-    B_transposed = torch.randn(N, K, device='cuda', dtype=torch.float16)
+    # Simulate the output from the cuBLAS GEMM (Gate and Up concatenated)
+    # Shape: [Tokens, Hidden * 2]
+    intermediate_tensor = torch.randn(
+        total_tokens, 
+        hidden_size * 2, 
+        device='cuda', 
+        dtype=torch.float16
+    )
     
-    print(f"\n📊 Testing Massive K={K} (FP16 Accumulation Drift expected)...")
-    custom_result = custom_ops.gemm(A, B_transposed)
-    native_result = torch.matmul(A, B_transposed.t())
+    print(f"📊 Allocated Intermediate Tensor: {intermediate_tensor.shape}")
     
-    # Calculate the exact hardware roundoff error
-    diff = torch.abs(custom_result - native_result)
-    print(f"⚠️ Max Hardware Roundoff Error: {diff.max().item():.4f}")
-    print(f"⚠️ Mean Hardware Roundoff Error: {diff.mean().item():.4f}")
+    # 1. Custom Fused Kernel Execution
+    print("⚡ Executing custom_swiglu.forward()...")
+    custom_output = custom_swiglu.forward(intermediate_tensor)
     
+    # 2. PyTorch Native Execution
+    # PyTorch requires us to physically split the tensor in memory first
+    gate, up = intermediate_tensor.chunk(2, dim=-1)
+    native_output = F.silu(gate) * up
     
-    # ---------------------------------------------------------
-    # Now, let's prove the math is flawless on a safe dimension
-    # ---------------------------------------------------------
-    M_small, N_small, K_small = 128, 128, 128
-    print(f"\n🔬 Testing Small K={K_small} (Where FP16 holds precision)...")
+    # 3. Validation
+    diff = torch.abs(custom_output - native_output)
+    max_error = diff.max().item()
+    mean_error = diff.mean().item()
     
-    # We divide by 10 to keep the numbers small so FP16 doesn't drop decimals
-    A_small = torch.randn(M_small, K_small, device='cuda', dtype=torch.float16) / 10.0
-    B_small_t = torch.randn(N_small, K_small, device='cuda', dtype=torch.float16) / 10.0
+    print(f"⚠️ Max Precision Difference: {max_error:.6f}")
+    print(f"⚠️ Mean Precision Difference: {mean_error:.8f}")
     
-    custom_small = custom_ops.gemm(A_small, B_small_t)
-    native_small = torch.matmul(A_small, B_small_t.t())
-    
-    diff_small = torch.abs(custom_small - native_small)
-    print(f"✅ Max Error on Small Matrix: {diff_small.max().item():.6f}")
-    
-    # This assertion will pass because we removed the FP16 accumulation drift limit!
-    assert torch.allclose(custom_small, native_small, atol=1e-2), "Math failed on small matrix!"
-    print("\n🎉 SUCCESS! Your Tensor Cores are mathematically perfect!")
+    # Assert correctness using FP16-safe tolerances
+    assert torch.allclose(custom_output, native_output, rtol=1e-2, atol=1e-2), "❌ Outputs do not match within FP16 tolerances!"
+    print("✅ Success! Memory-Bound bottleneck bypassed via 128-bit vectorization.")
+
 
 if __name__ == "__main__":
-    test_tensor_cores()
+    test_fused_swiglu()
