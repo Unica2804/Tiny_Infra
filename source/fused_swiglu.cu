@@ -42,7 +42,7 @@ __global__ void fused_swiglu_kernel(
             float up_val = __half2float(up_chunk.h8[i]);
 
             // Apply SiLU activation
-            float sigmoid = 1.0f/(1.0f + expf(-gate_val));
+            float sigmoid = 1.0f/(1.0f + __expf(-gate_val));
             float silu_val = gate_val * sigmoid;
 
             // Multiply the SiLU value with the up value

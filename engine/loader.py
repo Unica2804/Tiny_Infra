@@ -3,7 +3,8 @@
 import torch
 from safetensors.torch import load_file
 import os
-from model import QwenConfig, Qwen2ForCausalLM
+from model import Qwen2ForCausalLM
+from config import QwenConfig
 
 def load_qwen (model_path: str, device: str = "cuda") -> Qwen2ForCausalLM:
     """
