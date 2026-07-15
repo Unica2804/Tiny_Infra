@@ -1,70 +1,92 @@
 import torch
-import custom_rope
+import torch.nn.functional as F
+import custom_paged_attn
+import math
 
-def get_pytorch_rope(q, k, cos, sin, pos_ids):
-    """The memory-heavy PyTorch reference implementation."""
-    # Fetch the exact cos/sin for the current positions
-    cos_sliced = cos[pos_ids].unsqueeze(1) # [Tokens, 1, Half_Dim]
-    sin_sliced = sin[pos_ids].unsqueeze(1)
+def gather_contiguous_kv(k_cache, v_cache, block_table, context_len, block_size, num_kv_heads, head_dim):
+    """
+    Simulates the standard PyTorch requirement: 
+    Reconstructs a fragmented paged cache back into a single contiguous tensor.
+    """
+    k_contiguous = torch.zeros((num_kv_heads, context_len, head_dim), dtype=torch.float16, device='cuda')
+    v_contiguous = torch.zeros((num_kv_heads, context_len, head_dim), dtype=torch.float16, device='cuda')
     
-    # Split the head dimension
-    q1, q2 = q.chunk(2, dim=-1)
-    k1, k2 = k.chunk(2, dim=-1)
-    
-    # Mathematical rotation
-    rotated_q = torch.cat((-q2, q1), dim=-1)
-    rotated_k = torch.cat((-k2, k1), dim=-1)
-    
-    # PyTorch allocates massive new tensors right here:
-    q_out = (q * cos_sliced.repeat(1, 1, 2)) + (rotated_q * sin_sliced.repeat(1, 1, 2))
-    k_out = (k * cos_sliced.repeat(1, 1, 2)) + (rotated_k * sin_sliced.repeat(1, 1, 2))
-    
-    return q_out, k_out
+    for i in range(context_len):
+        logical_block = i // block_size
+        physical_block = block_table[logical_block].item()
+        block_offset = i % block_size
+        
+        k_contiguous[:, i, :] = k_cache[physical_block, :, block_offset, :]
+        v_contiguous[:, i, :] = v_cache[physical_block, :, block_offset, :]
+        
+    return k_contiguous, v_contiguous
 
-def test_rope():
-    print("🚀 Initializing In-Place RoPE Test...")
-    
-    # Qwen2 Scale Dimensions
-    num_tokens = 1024
-    num_heads = 32
-    num_kv_heads = 8 # Grouped Query Attention
+def test_micro_paged_attention():
+    print("🚀 Initializing Micro-PagedAttention Validation...")
+
+    # Architecture Dimensions
+    batch_size = 2
+    num_heads = 4
+    num_kv_heads = 4 # Standard MHA for this test (GQA is supported in C++)
     head_dim = 128
-    half_dim = head_dim // 2
-    max_seq_len = 2048
+    block_size = 16
     
-    # Initialize inputs
-    q = torch.randn(num_tokens, num_heads, head_dim, device='cuda', dtype=torch.float16)
-    k = torch.randn(num_tokens, num_kv_heads, head_dim, device='cuda', dtype=torch.float16)
-    
-    # Cos/Sin tables are usually FP32 for precision
-    cos = torch.randn(max_seq_len, half_dim, device='cuda', dtype=torch.float32)
-    sin = torch.randn(max_seq_len, half_dim, device='cuda', dtype=torch.float32)
-    
-    # Fake position IDs (e.g., token 0 to 1023)
-    pos_ids = torch.arange(num_tokens, dtype=torch.int32, device='cuda')
-    
-    # 1. Run PyTorch Reference (Using copies so we don't pollute the original)
-    q_ref, k_ref = get_pytorch_rope(q.clone(), k.clone(), cos, sin, pos_ids)
-    
-    # 2. Run Custom In-Place Kernel
-    # Notice we don't assign this to a new variable. The memory is mutated.
-    print("⚡ Executing custom_rope.apply_inplace()...")
-    custom_rope.apply_inplace(q, k, cos, sin, pos_ids)
+    # Memory Pool Dimensions
+    total_physical_blocks = 20
+    max_blocks_per_seq = 4
 
-    q_ref = q_ref.half()
-    k_ref = k_ref.half()
+    # 1. Simulate the Pre-Allocated VRAM Pool (Fragmented Memory)
+    k_cache = torch.randn(total_physical_blocks, num_kv_heads, block_size, head_dim, dtype=torch.float16, device='cuda')
+    v_cache = torch.randn(total_physical_blocks, num_kv_heads, block_size, head_dim, dtype=torch.float16, device='cuda')
+
+    # 2. Simulate User Requests
+    # Sequence 0 has 45 tokens. Sequence 1 has 23 tokens.
+    context_lens = torch.tensor([45, 23], dtype=torch.int32, device='cuda')
     
-    # 3. Validation
-    q_diff = torch.abs(q - q_ref).max().item()
-    k_diff = torch.abs(k - k_ref).max().item()
-    
-    print(f"⚠️ Max Q Precision Difference: {q_diff:.6f}")
-    print(f"⚠️ Max K Precision Difference: {k_diff:.6f}")
-    
-    assert torch.allclose(q, q_ref, atol=1e-2, rtol=1e-2), "❌ Q Math mismatch!"
-    assert torch.allclose(k, k_ref, atol=1e-2, rtol=1e-2), "❌ K Math mismatch!"
-    
-    print("✅ Success! Zero-allocation RoPE kernel verified.")
+    # 3. Simulate the Block Table (Random physical pages assigned to logical blocks)
+    block_tables = torch.tensor([
+        [14, 2, 8, 19],  # Seq 0 uses physical pages 14, 2, 8, and 19
+        [5, 11, -1, -1]  # Seq 1 uses physical pages 5 and 11
+    ], dtype=torch.int32, device='cuda')
+
+    # 4. The current generation step (Query for the exact current token)
+    q = torch.randn(batch_size, num_heads, head_dim, dtype=torch.float16, device='cuda')
+    out_custom = torch.zeros_like(q)
+
+    # --- EXECUTE PYTORCH REFERENCE ---
+    print("📊 Computing PyTorch Contiguous Baseline...")
+    out_ref = torch.zeros_like(q)
+    for i in range(batch_size):
+        c_len = context_lens[i].item()
+        if c_len == 0: continue
+        
+        # Reconstruct memory
+        k_contig, v_contig = gather_contiguous_kv(
+            k_cache, v_cache, block_tables[i], c_len, block_size, num_kv_heads, head_dim
+        )
+        
+        # Reshape for SDPA: [Heads, 1, Head_Dim] and [Heads, Seq, Head_Dim]
+        q_i = q[i].unsqueeze(1) 
+        k_i = k_contig
+        v_i = v_contig
+        
+        # Math calculation
+        attn_out = F.scaled_dot_product_attention(q_i, k_i, v_i)
+        out_ref[i] = attn_out.squeeze(1)
+
+    # --- EXECUTE CUSTOM KERNEL ---
+    print("⚡ Executing custom_paged_attn.launch_paged_attention()...")
+    custom_paged_attn.launch_paged_attention(
+        out_custom, q, k_cache, v_cache, block_tables, context_lens, block_size
+    )
+
+    # --- VALIDATION ---
+    diff = torch.abs(out_custom - out_ref).max().item()
+    print(f"⚠️ Max Precision Difference: {diff:.6f}")
+
+    # Standard FP16 Tiling tolerances
+    assert torch.allclose(out_custom, out_ref, atol=1e-2, rtol=1e-2), "❌ Math mismatch in PagedAttention!"
+    print("✅ Success! Custom PagedAttention kernel matches PyTorch exactly.")
 
 if __name__ == "__main__":
-    test_rope()
+    test_micro_paged_attention()
