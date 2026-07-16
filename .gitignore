@@ -10,3 +10,4 @@ wheels/
 # Virtual environments
 .venv
 weights/
+utils/fuse_weights.py

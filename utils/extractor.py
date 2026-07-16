@@ -51,10 +51,16 @@ def extract_and_save_weights(model_id: str, output_path: str) -> None:
             engine_prefix = f"blocks.{i}"
 
             # Extract attention projection matrices explicitly
-            mapped_weights[f"{engine_prefix}.attn.q_proj"] = state_dict[f"{hf_prefix}.self_attn.q_proj.weight"]
-            mapped_weights[f"{engine_prefix}.attn.k_proj"] = state_dict[f"{hf_prefix}.self_attn.k_proj.weight"]
-            mapped_weights[f"{engine_prefix}.attn.v_proj"] = state_dict[f"{hf_prefix}.self_attn.v_proj.weight"]
-            mapped_weights[f"{engine_prefix}.attn.out_proj"] = state_dict[f"{hf_prefix}.self_attn.o_proj.weight"]
+            mapped_weights[f"{engine_prefix}.attn.q_proj.weight"] = state_dict[f"{hf_prefix}.self_attn.q_proj.weight"]
+            mapped_weights[f"{engine_prefix}.attn.q_proj.bias"] = state_dict[f"{hf_prefix}.self_attn.q_proj.bias"]
+            
+            mapped_weights[f"{engine_prefix}.attn.k_proj.weight"] = state_dict[f"{hf_prefix}.self_attn.k_proj.weight"]
+            mapped_weights[f"{engine_prefix}.attn.k_proj.bias"] = state_dict[f"{hf_prefix}.self_attn.k_proj.bias"]
+            
+            mapped_weights[f"{engine_prefix}.attn.v_proj.weight"] = state_dict[f"{hf_prefix}.self_attn.v_proj.weight"]
+            mapped_weights[f"{engine_prefix}.attn.v_proj.bias"] = state_dict[f"{hf_prefix}.self_attn.v_proj.bias"]
+            
+            mapped_weights[f"{engine_prefix}.attn.out_proj.weight"] = state_dict[f"{hf_prefix}.self_attn.o_proj.weight"]
 
             # Extract SwiGLU MLP matrices explicitly
             mapped_weights[f"{engine_prefix}.mlp.gate_proj"] = state_dict[f"{hf_prefix}.mlp.gate_proj.weight"]

@@ -3,8 +3,8 @@
 import torch
 from safetensors.torch import load_file
 import os
-from model import Qwen2ForCausalLM
-from config import QwenConfig
+from models.qwen_25 import Qwen2ForCausalLM
+from models.config import QwenConfig
 
 def load_qwen (model_path: str, device: str = "cuda") -> Qwen2ForCausalLM:
     """
@@ -44,14 +44,20 @@ def load_qwen (model_path: str, device: str = "cuda") -> Qwen2ForCausalLM:
         # Define the base prefix for the PyTorch state_dict naming scheme for the current layer
         torch_prefix = f"model.layers.{i}"
         
-        # Translate the Query projection weight matrix for the current attention block
-        translated_state_dict[f"{torch_prefix}.self_attn.q_proj.weight"] = extracted_weights[f"{custom_prefix}.attn.q_proj"]
-        # Translate the Key projection weight matrix for the current attention block
-        translated_state_dict[f"{torch_prefix}.self_attn.k_proj.weight"] = extracted_weights[f"{custom_prefix}.attn.k_proj"]
-        # Translate the Value projection weight matrix for the current attention block
-        translated_state_dict[f"{torch_prefix}.self_attn.v_proj.weight"] = extracted_weights[f"{custom_prefix}.attn.v_proj"]
-        # Translate the Output projection weight matrix for the current attention block
-        translated_state_dict[f"{torch_prefix}.self_attn.o_proj.weight"] = extracted_weights[f"{custom_prefix}.attn.out_proj"]
+        # Translate the Query projection for the current attention block
+        translated_state_dict[f"{torch_prefix}.self_attn.q_proj.weight"] = extracted_weights[f"{custom_prefix}.attn.q_proj.weight"]
+        translated_state_dict[f"{torch_prefix}.self_attn.q_proj.bias"] = extracted_weights[f"{custom_prefix}.attn.q_proj.bias"]
+        
+        # Translate the Key projection for the current attention block
+        translated_state_dict[f"{torch_prefix}.self_attn.k_proj.weight"] = extracted_weights[f"{custom_prefix}.attn.k_proj.weight"]
+        translated_state_dict[f"{torch_prefix}.self_attn.k_proj.bias"] = extracted_weights[f"{custom_prefix}.attn.k_proj.bias"]
+        
+        # Translate the Value projection for the current attention block
+        translated_state_dict[f"{torch_prefix}.self_attn.v_proj.weight"] = extracted_weights[f"{custom_prefix}.attn.v_proj.weight"]
+        translated_state_dict[f"{torch_prefix}.self_attn.v_proj.bias"] = extracted_weights[f"{custom_prefix}.attn.v_proj.bias"]
+        
+        # Translate the Output projection for the current attention block
+        translated_state_dict[f"{torch_prefix}.self_attn.o_proj.weight"] = extracted_weights[f"{custom_prefix}.attn.out_proj.weight"]
         
         # Translate the Gate projection weight matrix for the current SwiGLU MLP block
         translated_state_dict[f"{torch_prefix}.mlp.gate_proj.weight"] = extracted_weights[f"{custom_prefix}.mlp.gate_proj"]

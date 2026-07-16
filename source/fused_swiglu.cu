@@ -67,7 +67,10 @@ torch::Tensor fused_swiglu(torch::Tensor input){
 
     TORCH_CHECK(hidden_size % 8 == 0, "Hidden size must be a multiple of 8 for vectorized access.");
 
-    auto output = torch::empty({total_tokens, hidden_size},torch::dtype(torch::kFloat16).device(input.device()));
+    std::vector<int64_t> out_shape = input.sizes().vec();
+    out_shape[out_shape.size() - 1] = hidden_size;
+    
+    auto output = torch::empty(out_shape, torch::dtype(torch::kFloat16).device(input.device()));
     int hidden_size_div_8 = hidden_size / 8;
     int total_chunks = total_tokens * hidden_size_div_8;
 

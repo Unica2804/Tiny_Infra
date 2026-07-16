@@ -99,15 +99,6 @@ class KVCacheManager:
                 # Slice the pre allocated cache tensors to insert the new keys and values at the correct positions
                 self.key_cache[layer_idx, physical_block, :, block_offset, :] = new_keys[i, :, t, :]
                 self.value_cache[layer_idx, physical_block, :, block_offset, :] = new_values[i, :, t, :]
-        # Update the sequence length tracker at the start of the layer.
-        if layer_idx == 0:
-            self.seq_len[batch_indices] += incoming_seq_len
-
-        # # Extract the max seq_len currently in the batch
-        # max_current_seq_len = torch.max(self.seq_len[batch_indices]).item()
-        # # Extract and return the active portion of the cache for the specified layer and batch indices
-        # fetched_keys = self.key_cache[layer_idx,batch_indices,:, :max_current_seq_len, :]
-        # fetched_values = self.value_cache[layer_idx,batch_indices,:, :max_current_seq_len, :]
 
         return self.block_tables , self.seq_len
     

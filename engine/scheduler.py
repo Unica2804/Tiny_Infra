@@ -3,7 +3,7 @@
 import asyncio
 import torch
 from typing import List, Optional
-from engine.model import Qwen2ForCausalLM
+from models.qwen_25 import Qwen2ForCausalLM
 from engine.cache_manager import KVCacheManager
 
 # Class to hold user generation request information
@@ -24,7 +24,22 @@ class ContinuousBatcher:
         # List to represent the physical cache slots, initialized with zeroes
         self.active_slots: List[Optional[GenerationRequest]] = [None] * self.max_batch_size
         self.device = kv_cache.device
+        self.cos_cache, self.sin_cache = self._init_rope_cache()
     
+    def _init_rope_cache(self):
+        # precompute the RoPE cache for the model and store it in the KVCacheManager
+        max_seq_len = self.kv_cache.max_seq_len
+        head_dim = self.kv_cache.head_dim
+
+        inv_freq = 1.0 / (1000000.0 ** (torch.arange(0, head_dim, 2, device=self.device).float() / head_dim))
+        t = torch.arange(max_seq_len, device=self.device, dtype=torch.float32)
+        freqs = torch.einsum("i,j->ij", t, inv_freq)
+        
+        # Compute the sine and cosine values for the RoPE cache
+        cos = freqs.cos().to(torch.float32)
+        sin = freqs.sin().to(torch.float32)
+        return cos, sin
+        
     async def generate(self, prompt_tokens:List[int], max_new_tokens:int)-> List[int]:
         # Create a new generation request
         request = GenerationRequest(prompt_tokens, max_new_tokens)
@@ -69,53 +84,72 @@ class ContinuousBatcher:
     # Main method to calculate next token for all active requests
     def _step_generation(self):
         # Create lists to hold active slots and corresponding tokens every tick
-        active_indices = []
-        current_tokens = []
+        prefill_indices = []
+        decode_indices = []
         # iterate through the active slots to gather the current tokens for each active request
         for slot_idx, req in enumerate(self.active_slots):
             # Check if the slot has an active request
             if req is not None:
                 # Append the slot index to the list of active indices
-                active_indices.append(slot_idx)
+                # active_indices.append(slot_idx)
                 # Check if the req is new or does it needs processing
                 if not req.is_prefilled:
-                    # !!! Modify this part later cuz we need to process the whole prompt rather than last token.
-
-                    token_to_feed = req.prompt_tokens[-1] 
-                    # Mark it as processed
-                    req.is_prefilled = True
+                    prefill_indices.append(slot_idx) 
                 else:
-                    # If it's already prefilled, we only feed the last generated token
-                    token_to_feed = req.generated_tokens[-1] 
-                current_tokens.append(token_to_feed)
-        # Convert the lists to tensors for model input
-        batch_indices = torch.tensor(active_indices, device=self.device, dtype=torch.long)
-        input_ids = torch.tensor(current_tokens, device=self.device, dtype=torch.long).view(-1,1)
+                    decode_indices.append(slot_idx) 
+
+        # phase-1 prefill
+        # process prefill requests individually
+        for slot_idx in prefill_indices:
+            self._execute_prefill(slot_idx)
+        
+        # phase-2 decode
+        # we batch all decode requests together for efficiency to maximize paged_attn
+        if decode_indices:
+            self._execute_decode(decode_indices)
+    
+    def _execute_prefill(self, slot_idx:int):
+        req = self.active_slots[slot_idx]
+
+        # feed the entire prompt into the model
+        input_idx = torch.tensor([req.prompt_tokens], device=self.device, dtype=torch.int32)
+        batch_indices = torch.tensor([slot_idx], device=self.device, dtype=torch.int32) 
 
         with torch.no_grad():
-            logits = self.model(input_ids,batch_indices,self.kv_cache)
-        # Extract the logits of the last token
-        next_token_logits = logits[:, -1, :]
-        # Use argmax to select the next token for each active request
-        next_tokens = torch.argmax(next_token_logits, dim=-1)
-        # Convert it back to a list
-        predicted_tokens_ids = next_tokens.tolist()
+            logits = self.model(input_idx, batch_indices, self.kv_cache, self.cos_cache, self.sin_cache)
 
-        # Iterate through the predicted tokens to map them back to their requests
-        for i, slot_idx in enumerate(active_indices):
-            # Grab the corresponding request from the active slots
+        self.kv_cache.seq_len[batch_indices] += input_idx.size(1)
+        # grab the prediction for the final token in the prompt
+        next_token = torch.argmax(logits[:, -1, :],dim=-1).item()
+        req.generated_tokens.append(next_token)
+        req.is_prefilled = True
+
+    def _execute_decode(self, decode_indices: List[int]):
+        current_tokens = []
+        for slot_idx in decode_indices:
             req = self.active_slots[slot_idx]
-            # Grap the token Id that the model predicted for this request
-            new_token = predicted_tokens_ids[i]
-            # append the new token to the generated tokens list of the request
-            req.generated_tokens.append(new_token)
-        # Check if the user has reached the max_new_tokens limit, if so we can mark the request as complete and free up the slot
-        if len(req.generated_tokens)>=req.max_new_tokens:
-            print(f"Request in slot {slot_idx} has completed generation. Freeing up the slot.")
-            # Trigger the completion event to notify the waiting coroutine that generation is complete
-            req.completion_event.set()
-            # Free the batch slot in the cache manager
-            self.kv_cache.free_batch_slot(slot_idx)
-            # set the active slot to None to indicate it's now free
-            self.active_slots[slot_idx] = None
+            # Get the last generated token for each active request
+            current_tokens.append(req.generated_tokens[-1])
+        
+        # Batch them together into [Batch, 1] tensor
+        input_idx = torch.tensor(current_tokens, device=self.device, dtype=torch.int32).view(-1,1)
+        batch_indices = torch.tensor(decode_indices, device=self.device, dtype=torch.int32)
 
+        with torch.no_grad():
+            logits = self.model(input_idx, batch_indices, self.kv_cache, self.cos_cache, self.sin_cache)
+        
+        self.kv_cache.seq_len[batch_indices] += 1
+
+        next_tokens = torch.argmax(logits[:, -1, :], dim=-1).tolist()
+
+        for i, slot_idx in enumerate(decode_indices):
+            req = self.active_slots[slot_idx]
+            req.generated_tokens.append(next_tokens[i])
+
+            if len(req.generated_tokens) >= req.max_new_tokens:
+                # Mark the request as complete and set the completion event
+                print(f"Request in slot {slot_idx} has completed generation.")
+                req.completion_event.set()
+                # dynamically wipe the fragment block tables
+                self.kv_cache.free_batch_slot(slot_idx)
+                self.active_slots[slot_idx] = None
