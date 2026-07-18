@@ -36,8 +36,10 @@ async def run_inference():
         dtype=torch.float16
     )
 
+    eos_token_id = tokenizer.eos_token_id  # Get the EOS token ID from the tokenizer
+
     # 4. Initialize the Continuous Batching Scheduler
-    scheduler = ContinuousBatcher(model, kv_cache)
+    scheduler = ContinuousBatcher(model, kv_cache, eos_token_id=eos_token_id)
 
     # Start the scheduler's background loop
     loop_task = asyncio.create_task(scheduler.run_loop())
@@ -61,10 +63,10 @@ async def run_inference():
     # 6. Decode and Print the Results
     print("\n=========================================")
     print(f"User 1 Prompt: {prompt_1}")
-    print(f"User 1 Output: {tokenizer.decode(results[0])}")
+    print(f"User 1 Output: {tokenizer.decode(results[0], skip_special_tokens=True)}")
     print("-----------------------------------------")
     print(f"User 2 Prompt: {prompt_2}")
-    print(f"User 2 Output: {tokenizer.decode(results[1])}")
+    print(f"User 2 Output: {tokenizer.decode(results[1], skip_special_tokens=True)}")
     print("=========================================")
 
     # Kill the background loop once done

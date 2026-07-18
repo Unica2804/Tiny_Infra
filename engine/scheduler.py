@@ -16,7 +16,7 @@ class GenerationRequest:
         self.is_prefilled = False
 
 class ContinuousBatcher:
-    def __init__(self, model:Qwen2ForCausalLM, kv_cache:KVCacheManager):
+    def __init__(self, model:Qwen2ForCausalLM, kv_cache:KVCacheManager, eos_token_id: Optional[int]=None):
         self.model = model
         self.kv_cache = kv_cache
         self.requests_queue: asyncio.Queue[GenerationRequest] = asyncio.Queue()
@@ -25,6 +25,7 @@ class ContinuousBatcher:
         self.active_slots: List[Optional[GenerationRequest]] = [None] * self.max_batch_size
         self.device = kv_cache.device
         self.cos_cache, self.sin_cache = self._init_rope_cache()
+        self.eos_token_id = eos_token_id
     
     def _init_rope_cache(self):
         # precompute the RoPE cache for the model and store it in the KVCacheManager
@@ -122,7 +123,21 @@ class ContinuousBatcher:
         # grab the prediction for the final token in the prompt
         next_token = torch.argmax(logits[:, -1, :],dim=-1).item()
         req.generated_tokens.append(next_token)
-        req.is_prefilled = True
+
+        hit_eos = (self.eos_token_id is not None) and (next_token == self.eos_token_id)
+        hit_max_tokens = len(req.generated_tokens) >= req.max_new_tokens
+
+        if hit_eos or hit_max_tokens:
+            stop_reason = "EOS Token" if hit_eos else "Max Tokens"
+            print(f"Request in slot {slot_idx} completed immediately during prefill ({stop_reason}).")
+            req.completion_event.set()
+            
+            # Wipe the fragment block tables
+            self.kv_cache.free_batch_slot(slot_idx)
+            self.active_slots[slot_idx] = None
+        else:
+            # Only flag for the decode phase if generation needs to continue
+            req.is_prefilled = True
 
     def _execute_decode(self, decode_indices: List[int]):
         current_tokens = []
@@ -146,7 +161,10 @@ class ContinuousBatcher:
             req = self.active_slots[slot_idx]
             req.generated_tokens.append(next_tokens[i])
 
-            if len(req.generated_tokens) >= req.max_new_tokens:
+            hit_eos = (self.eos_token_id is not None) and (next_tokens == self.eos_token_id)
+            hit_max_tokens = len(req.generated_tokens) >= req.max_new_tokens
+
+            if hit_eos or hit_max_tokens:
                 # Mark the request as complete and set the completion event
                 print(f"Request in slot {slot_idx} has completed generation.")
                 req.completion_event.set()
