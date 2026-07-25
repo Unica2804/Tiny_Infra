@@ -4,4 +4,24 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "torch",
+    "torchvision",
+    "torchaudio",
+    "accelerate",
+    "safetensors",
+    "numpy",
+    "transformers",
+    "asyncio",
+]
+# Configure the PyTorch CUDA 12.8 wheel repository
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true  # Prevents non-PyTorch packages from searching this index
+
+# Map PyTorch packages to pull strictly from the cu128 index
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu128" }]
+torchvision = [{ index = "pytorch-cu128" }]
+torchaudio = [{ index = "pytorch-cu128" }]

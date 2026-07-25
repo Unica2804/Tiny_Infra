@@ -26,10 +26,10 @@ __inline__ __device__ float warp_reduce_sum(float val){
 }
 
 __inline__ __device__ float block_reduce_sum(float val) {
-    // Step 1: Reduce within the local warp (32 threads)
+    // Reduce within the local warp (32 threads)
     float sum = warp_reduce_sum(val);
     
-    // Step 2: Thread 0 of each warp writes its sum to shared memory
+    // Thread 0 of each warp writes its sum to shared memory
     __shared__ float warp_sums[32]; // Accommodates up to 32 warps (1024 threads max)
     
     int warp_id = threadIdx.x / 32;
@@ -40,7 +40,7 @@ __inline__ __device__ float block_reduce_sum(float val) {
     }
     __syncthreads(); // Wait for all warps to finish writing
     
-    // Step 3: The first warp reads the saved sums and reduces them into the final total
+    // The first warp reads the saved sums and reduces them into the final total
     float block_sum = 0.0f;
     if (warp_id == 0) {
         // Only read valid warp sums, pad the rest with 0

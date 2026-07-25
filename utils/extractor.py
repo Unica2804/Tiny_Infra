@@ -89,5 +89,5 @@ def extract_and_save_weights(model_id: str, output_path: str) -> None:
 
 if __name__ == "__main__":
     TARGET_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
-    OUTPUT_FILE = "qwen25_0.5b_extracted.safetensors"
+    OUTPUT_FILE = "weights/qwen25_0.5b_extracted.safetensors"
     extract_and_save_weights(TARGET_MODEL, OUTPUT_FILE)
