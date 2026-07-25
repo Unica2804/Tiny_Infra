@@ -1,5 +1,5 @@
 # include <cuda_fp16.h>
-# include <torch/extension.h>
+# include <torch/torch.h>
 
 struct PagedAttentionArgs {
 

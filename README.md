@@ -1,4 +1,4 @@
-# Building a Custom Inference Engine for Qwen2.5-0.5B: A Journey from Scratch 
+# Building a Custom Inference Engine: A Journey from Scratch 
 
 **Abstract:**
 This document details the architecture, design decisions, and engineering challenges of building a custom, hardware-accelerated Large Language Model (LLM) inference engine from the ground up. Targeting the Qwen2.5-0.5B-Instruct architecture, the project eschewed high-level abstractions in favor of bare-metal PyTorch and custom CUDA kernels. The system features a Paged KV Cache, an asynchronous Continuous Batching Scheduler, and fused GPU kernels. This post chronicles the development lifecycle, highlighting the subtle mathematical and structural bugs encountered during implementation and the methodologies used to resolve them.
@@ -55,7 +55,7 @@ Building an engine from scratch is an exercise in precision. While compilation e
 
 ### 4.5 Managing Sequence Termination (EOS)
 **The Problem:** The engine successfully generated coherent text but suffered from runaway generation, only stopping when it hit the arbitrary `max_new_tokens` limit, wasting compute.
-**The Solution:** We extracted the `eos_token_id` from the HuggingFace tokenizer and integrated an early-stopping monitor into both the Prefill and Decode phases. If the model predicts `<|im_end|>`, the scheduler immediately marks the request as complete, tears down the active slot, and frees the physical memory blocks back to the available pool.
+**The Solution:** We extracted the `eos_token_id` from the HuggingFace tokenizer and integrated an early-stopping monitor into both the Prefill and Decode phases. If the model predicts `<|im_end|>`, the scheduler immediately marks the request as complete, tears down the active slot, and frees the physical memory blocks back to the available pool. Also applied chat template so the prompt is formatted according to model's generation_config.
 
 ---
 
@@ -68,4 +68,3 @@ The completion of this pipeline marks the successful deployment of a high-perfor
 2.  **Quantization:** Extending the custom kernels to support INT8/INT4 weight-only quantization to further reduce the VRAM footprint and increase memory bandwidth utilization.
 3. **Sampling:** Currently the engine uses greedy search using argmax we need to add sampling support with p, temp, top-k also repeat penalty (qwen-2.5-0.5B hallucinates and gets stuck in a loop).
 4. **Vectorization:** Currently for loops during decoding phase slows and adds memory overhead as a result compute is not utilized properly
-5. **KV_Cache optimiazation:** Currently for the block table and unnecesarry dimensions a tensor is created which the cpu sync and adds overhead need to shift them to cpu rather than keeping them on gpu. 

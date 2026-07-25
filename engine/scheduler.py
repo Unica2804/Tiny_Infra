@@ -160,8 +160,8 @@ class ContinuousBatcher:
         for i, slot_idx in enumerate(decode_indices):
             req = self.active_slots[slot_idx]
             req.generated_tokens.append(next_tokens[i])
-
-            hit_eos = (self.eos_token_id is not None) and (next_tokens == self.eos_token_id)
+            new_token = next_tokens[i]
+            hit_eos = (self.eos_token_id is not None) and (new_token == self.eos_token_id)
             hit_max_tokens = len(req.generated_tokens) >= req.max_new_tokens
 
             if hit_eos or hit_max_tokens:

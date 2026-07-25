@@ -8,11 +8,11 @@ from engine.cache_manager import KVCacheManager
 from engine.scheduler import ContinuousBatcher
 
 async def run_inference():
-    print("🚀 Booting Custom Inference Engine...")
+    print("Booting Custom Inference Engine...")
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # 1. Load the Tokenizer (using HuggingFace just for text <-> ID conversion)
-    tokenizer_path = "Qwen/Qwen2.5-0.5B" # Change to local path if you downloaded it
+    tokenizer_path = "Qwen/Qwen2.5-0.5B-Instruct" # Change to local path if you downloaded it
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
 
     # 2. Load the Model Weights into our Custom Architecture
@@ -36,8 +36,8 @@ async def run_inference():
         dtype=torch.float16
     )
 
-    eos_token_id = tokenizer.eos_token_id  # Get the EOS token ID from the tokenizer
-
+    eos_token_id = tokenizer.eos_token_id 
+    
     # 4. Initialize the Continuous Batching Scheduler
     scheduler = ContinuousBatcher(model, kv_cache, eos_token_id=eos_token_id)
 
@@ -47,9 +47,12 @@ async def run_inference():
     # 5. Define two concurrent user requests
     prompt_1 = "The capital of France is"
     prompt_2 = "Write a short poem about the ocean:"
-    
-    tokens_1 = tokenizer.encode(prompt_1)
-    tokens_2 = tokenizer.encode(prompt_2)
+
+    formatted_1 = tokenizer.apply_chat_template([{"role": "user", "content": prompt_1}], tokenize=False, add_generation_prompt=True)
+    formatted_2 = tokenizer.apply_chat_template([{"role": "user", "content": prompt_2}], tokenize=False, add_generation_prompt=True)
+
+    tokens_1 = tokenizer.encode(formatted_1)
+    tokens_2 = tokenizer.encode(formatted_2)
 
     print("\n📩 Sending requests to the scheduler...")
     

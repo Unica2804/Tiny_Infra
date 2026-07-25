@@ -1,4 +1,4 @@
-# include <torch/extension.h>
+# include <torch/torch.h>
 # include <cuda_fp16.h>
 # include <math_constants.h>
 

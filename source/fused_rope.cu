@@ -1,6 +1,6 @@
 // Inplace rotary positional embedding (RoPE) implementation for fused attention kernels.
 
-# include <torch/extension.h>
+# include <torch/torch.h>
 # include <cuda_fp16.h>
 
 __global__ void fused_rope_kernel(
