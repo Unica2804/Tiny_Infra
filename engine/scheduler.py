@@ -8,9 +8,12 @@ from engine.cache_manager import KVCacheManager
 
 # Class to hold user generation request information
 class GenerationRequest:
-    def __init__(self, prompt_tokens:List[int], max_new_tokens:int):
+    def __init__(self, prompt_tokens:List[int], max_new_tokens:int, temperature:float = 0.7, p_value: float = 0.9, top_k:int = 20):
         self.prompt_tokens = prompt_tokens
         self.max_new_tokens = max_new_tokens
+        self.temperature = temperature
+        self.p_value = p_value
+        self.top_k = top_k
         self.generated_tokens = []
         self.completion_event = asyncio.Event()
         self.is_prefilled = False
@@ -41,9 +44,9 @@ class ContinuousBatcher:
         sin = freqs.sin().to(torch.float32)
         return cos, sin
         
-    async def generate(self, prompt_tokens:List[int], max_new_tokens:int)-> List[int]:
+    async def generate(self, prompt_tokens:List[int], max_new_tokens:int, temperature:float = 0.7, p_value: float = 0.9, top_k:int = 20)-> List[int]:
         # Create a new generation request
-        request = GenerationRequest(prompt_tokens, max_new_tokens)
+        request = GenerationRequest(prompt_tokens, max_new_tokens, temperature, p_value, top_k)
         # Add the request to the queue
         await self.requests_queue.put(request)
         # Wait for the completion event to be set, indicating that the generation is complete
@@ -66,6 +69,51 @@ class ContinuousBatcher:
                 await asyncio.sleep(0.01)
             # Yield control to the event loop to allow generation requests again.
             await asyncio.sleep(0)
+    def _sample_next_token(
+        self,
+        logits: torch.Tensor,
+        requests: List[GenerationRequest]) -> List[int]:
+
+        # Applies Temperature, Top-K, and Top-P sampling to the logits for each request in the batch and returns the sampled next token IDs.
+        next_token_logits = logits[:, -1, :].clone()
+        next_tokens = []
+
+        for row_idx, req in enumerate(requests):
+            row_logits = next_token_logits[row_idx : row_idx + 1]
+            
+            # greedy sampling if temperature is 0.0
+            if req.temperature == 0.0:
+                token_id = torch.argmax(row_logits, dim=-1).item()
+                next_tokens.append(token_id)
+                continue
+            row_logits = row_logits / req.temperature
+
+            # Top-K sampling
+            if req.top_k > 0 and req.top_k < row_logits.size(-1):
+                top_k_values= min(req.top_k, row_logits.size(-1))
+                k_th_val,_ = torch.topk(row_logits, top_k_values, dim=-1)
+                min_top_k = k_th_val[:, -1:]
+                row_logits[row_logits < min_top_k] = float('-inf')
+            
+            # P_value (nucleus) sampling
+            if req.p_value < 1.0:
+                sorted_logits, sorted_indices = torch.sort(row_logits, descending=True)
+                sorted_probs = torch.softmax(sorted_logits, dim=-1)
+                cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+                # Shift the cumulative probabilities to the right to keep the first token above threshold
+                sorted_indices_to_remove = cumulative_probs > req.p_value
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                sorted_indices_to_remove[..., 0] = False
+                # Scatter mask back to the original indices
+                indices_to_remove = sorted_indices_to_remove.scatter(
+                    dim=-1, index=sorted_indices, src=sorted_indices_to_remove
+                )
+                row_logits[indices_to_remove] = float('-inf')
+            probs = torch.softmax(row_logits, dim=-1)
+            token_id = torch.multinomial(probs, num_samples=1).item()
+            next_tokens.append(token_id)
+        return next_tokens
+
     # helper to pull requests from the queue and fill the active slots
     def _fill_active_slots(self):
         for i in range(self.max_batch_size):
@@ -121,7 +169,7 @@ class ContinuousBatcher:
 
         self.kv_cache.seq_len[batch_indices] += input_idx.size(1)
         # grab the prediction for the final token in the prompt
-        next_token = torch.argmax(logits[:, -1, :],dim=-1).item()
+        next_token = self._sample_next_token(logits, [req])[0]
         req.generated_tokens.append(next_token)
 
         hit_eos = (self.eos_token_id is not None) and (next_token == self.eos_token_id)
@@ -141,10 +189,12 @@ class ContinuousBatcher:
 
     def _execute_decode(self, decode_indices: List[int]):
         current_tokens = []
+        active_requests = []
         for slot_idx in decode_indices:
             req = self.active_slots[slot_idx]
             # Get the last generated token for each active request
             current_tokens.append(req.generated_tokens[-1])
+            active_requests.append(req)
         
         # Batch them together into [Batch, 1] tensor
         input_idx = torch.tensor(current_tokens, device=self.device, dtype=torch.int32).view(-1,1)
@@ -155,12 +205,13 @@ class ContinuousBatcher:
         
         self.kv_cache.seq_len[batch_indices] += 1
 
-        next_tokens = torch.argmax(logits[:, -1, :], dim=-1).tolist()
+        next_tokens = self._sample_next_token(logits, active_requests)
 
         for i, slot_idx in enumerate(decode_indices):
             req = self.active_slots[slot_idx]
-            req.generated_tokens.append(next_tokens[i])
             new_token = next_tokens[i]
+            req.generated_tokens.append(next_tokens[i])
+
             hit_eos = (self.eos_token_id is not None) and (new_token == self.eos_token_id)
             hit_max_tokens = len(req.generated_tokens) >= req.max_new_tokens
 

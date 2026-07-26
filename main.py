@@ -54,11 +54,11 @@ async def run_inference():
     tokens_1 = tokenizer.encode(formatted_1)
     tokens_2 = tokenizer.encode(formatted_2)
 
-    print("\n📩 Sending requests to the scheduler...")
+    print("\nSending requests to the scheduler...")
     
     # Run both generation tasks simultaneously (Continuous Batching in action)
     task1 = scheduler.generate(prompt_tokens=tokens_1, max_new_tokens=300)
-    task2 = scheduler.generate(prompt_tokens=tokens_2, max_new_tokens=500)
+    task2 = scheduler.generate(prompt_tokens=tokens_2, max_new_tokens=500, temperature=1.1, top_k=50)
 
     # Wait for both to finish
     results = await asyncio.gather(task1, task2)
