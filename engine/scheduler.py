@@ -2,10 +2,11 @@
 
 import asyncio
 import torch
-from typing import List, Optional
+from typing import List, Optional, AsyncGenerator
 from models.qwen_25 import Qwen2ForCausalLM
 from engine.cache_manager import KVCacheManager
 
+_END_OF_STREAM = object()  # Sentinel value to indicate the end of a stream
 # Class to hold user generation request information
 class GenerationRequest:
     def __init__(self, prompt_tokens:List[int], max_new_tokens:int, temperature:float = 0.7, p_value: float = 0.9, top_k:int = 20):
@@ -15,7 +16,9 @@ class GenerationRequest:
         self.p_value = p_value
         self.top_k = top_k
         self.generated_tokens = []
+        self.token_queue = asyncio.Queue()
         self.completion_event = asyncio.Event()
+        self.error = None
         self.is_prefilled = False
 
 class ContinuousBatcher:
@@ -43,17 +46,38 @@ class ContinuousBatcher:
         cos = freqs.cos().to(torch.float32)
         sin = freqs.sin().to(torch.float32)
         return cos, sin
-        
-    async def generate(self, prompt_tokens:List[int], max_new_tokens:int, temperature:float = 0.7, p_value: float = 0.9, top_k:int = 20)-> List[int]:
+    
+    async def generate_stream(
+        self,
+        prompt_tokens: List[int],
+        max_new_tokens: int,
+        temperature: float = 0.7,
+        p_value: float = 0.9,
+        top_k: int = 20
+    ) -> AsyncGenerator[int, None]:
         # Create a new generation request
         request = GenerationRequest(prompt_tokens, max_new_tokens, temperature, p_value, top_k)
         # Add the request to the queue
         await self.requests_queue.put(request)
-        # Wait for the completion event to be set, indicating that the generation is complete
-        await request.completion_event.wait()
-        # return the generated tokens after the generation is complete
-        return request.generated_tokens
-    
+
+        while True:
+            # Wait for the next token to be available in the token queue
+            next_token = await request.token_queue.get()
+            if next_token is _END_OF_STREAM:
+                if request.error is not None:
+                    raise request.error
+                break
+            yield next_token
+
+
+    async def generate(self, prompt_tokens:List[int], max_new_tokens:int, temperature:float = 0.7, p_value: float = 0.9, top_k:int = 20)-> List[int]:
+        tokens = []
+        async for token in self.generate_stream(
+            prompt_tokens, max_new_tokens, temperature, p_value, top_k
+        ):
+            tokens.append(token)
+        return tokens
+
     async def run_loop(self):
         print("Continious batcher engine has started and monitors the requests queue for incoming generation requests.")
         while True:
@@ -150,13 +174,37 @@ class ContinuousBatcher:
         # phase-1 prefill
         # process prefill requests individually
         for slot_idx in prefill_indices:
-            self._execute_prefill(slot_idx)
+            try:
+                self._execute_prefill(slot_idx)
+            except Exception as e:
+                self._finish_request(slot_idx, reason="Error during prefill", error=e)
+            
         
         # phase-2 decode
         # we batch all decode requests together for efficiency to maximize paged_attn
         if decode_indices:
-            self._execute_decode(decode_indices)
-    
+            try:
+                self._execute_decode(decode_indices)
+            except Exception as e:
+                for slot_idx in decode_indices:
+                    self._finish_request(slot_idx, reason="Error during decode", error=e)
+
+    def _finish_request(self, slot_idx:int, reason:str, error: Optional[Exception]=None):
+        req = self.active_slots[slot_idx]
+        if req is not None:
+            return
+        req.error = error
+        req.completion_event.set()
+        req.token_queue.put_nowait(_END_OF_STREAM)
+
+        self.kv_cache.free_batch_slot(slot_idx)
+        self.active_slots[slot_idx] = None
+
+        if error:
+            print(f"Slot {slot_idx} request terminated due to error: {error}")
+        else:
+            print(f"Slot {slot_idx} request completed successfully due to: {reason}")
+
     def _execute_prefill(self, slot_idx:int):
         req = self.active_slots[slot_idx]
 
@@ -171,6 +219,7 @@ class ContinuousBatcher:
         # grab the prediction for the final token in the prompt
         next_token = self._sample_next_token(logits, [req])[0]
         req.generated_tokens.append(next_token)
+        req.token_queue.put_nowait(next_token)
 
         hit_eos = (self.eos_token_id is not None) and (next_token == self.eos_token_id)
         hit_max_tokens = len(req.generated_tokens) >= req.max_new_tokens
@@ -211,6 +260,7 @@ class ContinuousBatcher:
             req = self.active_slots[slot_idx]
             new_token = next_tokens[i]
             req.generated_tokens.append(next_tokens[i])
+            req.token_queue.put_nowait(next_tokens[i])
 
             hit_eos = (self.eos_token_id is not None) and (new_token == self.eos_token_id)
             hit_max_tokens = len(req.generated_tokens) >= req.max_new_tokens

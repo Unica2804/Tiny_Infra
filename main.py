@@ -1,11 +1,35 @@
 import asyncio
 import torch
+import sys
 from transformers import AutoTokenizer
 from models.config import QwenConfig
 
 from engine.loader import load_qwen
 from engine.cache_manager import KVCacheManager
 from engine.scheduler import ContinuousBatcher
+
+
+async def consume_stream(request_id: str, stream_gen, tokenizer):
+    print(f"\n[Request {request_id}] Started streaming....")
+    generated_ids = []
+    printed_len = 0
+    try:
+        async for token_id in stream_gen:
+            generated_ids.append(token_id)
+            
+            # Decode accumulated tokens with special token handling
+            text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+
+            # Print only the new part of the text
+            new_text = text[printed_len:]
+            if new_text:
+                sys.stdout.write(f"\n[Req {request_id}]: {new_text}")
+                sys.stdout.flush()
+                printed_len = len(text)
+    except Exception as e:
+        print(f"\n[Request {request_id}] Error during streaming: {e}")
+    else:
+        print(f"\n[Request {request_id}] Streaming completed.")
 
 async def run_inference():
     print("Booting Custom Inference Engine...")
@@ -55,25 +79,28 @@ async def run_inference():
     tokens_2 = tokenizer.encode(formatted_2)
 
     print("\nSending requests to the scheduler...")
+    stream_1 = scheduler.generate_stream(prompt_tokens=tokens_1, max_new_tokens=30)
+    stream_2 = scheduler.generate_stream(prompt_tokens=tokens_2, max_new_tokens=500, temperature=1.1, top_k=50)
     
     # Run both generation tasks simultaneously (Continuous Batching in action)
-    task1 = scheduler.generate(prompt_tokens=tokens_1, max_new_tokens=300)
-    task2 = scheduler.generate(prompt_tokens=tokens_2, max_new_tokens=500, temperature=1.1, top_k=50)
+    task1 = asyncio.create_task(consume_stream("1", stream_1, tokenizer))
+    task2 = asyncio.create_task(consume_stream("2", stream_2, tokenizer))
 
-    # Wait for both to finish
-    results = await asyncio.gather(task1, task2)
+    await asyncio.gather(task1, task2)
+    # # Wait for both to finish
+    # results = await asyncio.gather(task1, task2)
 
-    # 6. Decode and Print the Results
-    print("\n=========================================")
-    print(f"User 1 Prompt: {prompt_1}")
-    print(f"User 1 Output: {tokenizer.decode(results[0], skip_special_tokens=True)}")
-    print("-----------------------------------------")
-    print(f"User 2 Prompt: {prompt_2}")
-    print(f"User 2 Output: {tokenizer.decode(results[1], skip_special_tokens=True)}")
-    print("=========================================")
+    # # 6. Decode and Print the Results
+    # print("\n=========================================")
+    # print(f"User 1 Prompt: {prompt_1}")
+    # print(f"User 1 Output: {tokenizer.decode(results[0], skip_special_tokens=True)}")
+    # print("-----------------------------------------")
+    # print(f"User 2 Prompt: {prompt_2}")
+    # print(f"User 2 Output: {tokenizer.decode(results[1], skip_special_tokens=True)}")
+    # print("=========================================")
 
-    # Kill the background loop once done
-    loop_task.cancel()
+    # # Kill the background loop once done
+    # loop_task.cancel()
 
 if __name__ == "__main__":
     asyncio.run(run_inference())
