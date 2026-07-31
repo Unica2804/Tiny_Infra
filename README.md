@@ -5,6 +5,45 @@ This document details the architecture, design decisions, and engineering challe
 
 ---
 
+## Architecture & Data Flow Breakdown
+
+```
++-----------------------------------------------------------------------------------+
+|                                  USER / CLIENT                                    |
++-----------------------------------------------------------------------------------+
+       |                                                                   ^
+       | 1. generate_stream(prompt_tokens, ...)                            | 6. Yield Tokens
+       v                                                                   |
++-----------------------------------------------------------------------------------+
+|                                CONTINUOUS BATCHER                                 |
+|                                                                                   |
+|  Requests Queue: [ GenerationRequest_1, GenerationRequest_2, ... ]               |
+|  Active Slots:   [ Slot_0 (Req 1) | Slot_1 (Req 2) | Slot_2 (None) | Slot_3 (None) ] |
++-----------------------------------------------------------------------------------+
+       |                                                                   ^
+       | 2. Extract Active Requests                                        | 5. Store Tokens &
+       |    & Batch Tensors                                                |    Check EOS/Max
+       v                                                                   |
++-----------------------------------------------------------------------------------+
+|                         PYTORCH MODEL & CUDA KERNELS                              |
+|                                                                                   |
+|  - Qwen2ForCausalLM Forward Pass                                                  |
+|  - RoPE Embeddings & Paged Attention Kernel                                       |
+|  - Vectorized Temperature / Top-K / Top-P Sampling                                |
++-----------------------------------------------------------------------------------+
+       |                                                                   ^
+       | 3. Read/Write KV Blocks                                           | 4. Update Slot
+       v                                                                   |    Sequence Length
++-----------------------------------------------------------------------------------+
+|                                 KV-CACHE MANAGER                                  |
+|                                                                                   |
+|  - Physical Block Allocator (Block Size = 16)                                     |
+|  - Slot-to-Block Mapping Tables                                                   |
++-----------------------------------------------------------------------------------+
+```
+
+---
+
 ## 1. Architectural Foundation: The Explicit Layout
 
 Modern LLM frameworks (like HuggingFace `transformers`) are built for general-purpose flexibility, often at the cost of highly localized optimizations. To maximize efficiency, we defined an **explicit custom engine layout**. 
@@ -28,6 +67,21 @@ To bypass the overhead of standard PyTorch operations during the decode phase, w
 * **Fused RoPE (`fused_rope.cu`):** Performs Rotary Positional Embeddings entirely in-place, drastically reducing VRAM read/write bandwidth.
 * **Paged Attention (`attention.cu`):** A custom scaled dot-product attention kernel that understands our virtual block tables, allowing it to attend to scattered memory blocks seamlessly without gathering them into a contiguous tensor first.
 * **Fused SwiGLU (`fused_swiglu.cu`):** Combines the Gated Linear Unit and SiLU activation functions into a single kernel launch.
+
+---
+
+## What Sets This Engine Apart (Comparison)
+
+Unlike standard inference frameworks or naive wrappers, this engine explicitly handles memory management and execution scheduling at the raw kernel interface level:
+
+| Feature / Metric | Naive PyTorch / Transformers | Enterprise (vLLM / TGI) | Our Custom Engine |
+| :--- | :--- | :--- | :--- |
+| **KV Cache Allocation** | Contiguous padding to `max_seq_len` | Paged Attention (Block Tables) | **Paged KV Allocation (Block Size = 16)** |
+| **Batching Strategy** | Static batching (padded strings) | Continuous Batching / Iteration-level | **Continuous Batching with Prefill/Decode Split** |
+| **Weight Extraction** | Automatic AutoModel loading | Custom C++ / Rust engines | **Explicit Safetensors Mapper & Loader** |
+| **Sampling Execution** | Python loops / HF Generate wrappers | C++ CUDA sampling kernels | **Fully Vectorized PyTorch Tensor Pipeline** |
+| **Streaming Mechanism** | Blocking generators / TextStreamer | gRPC / HTTP Server Push | **Native `asyncio.Queue` Sentinel Streams** |
+| **Dependency Footprint** | Massive (Transformers, Accelerate) | High (C++ CUDA extensions) | **Minimal (PyTorch + HuggingFace Tokenizer)** |
 
 ---
 
@@ -57,6 +111,42 @@ Building an engine from scratch is an exercise in precision. While compilation e
 **The Problem:** The engine successfully generated coherent text but suffered from runaway generation, only stopping when it hit the arbitrary `max_new_tokens` limit, wasting compute.
 **The Solution:** We extracted the `eos_token_id` from the HuggingFace tokenizer and integrated an early-stopping monitor into both the Prefill and Decode phases. If the model predicts `<|im_end|>`, the scheduler immediately marks the request as complete, tears down the active slot, and frees the physical memory blocks back to the available pool. Also applied chat template so the prompt is formatted according to model's generation_config.
 
+### 4.6 Asynchronous Consumer Hanging on Stream Exit (Missing Sentinel)
+* **Problem**: Successfully completed requests generated text correctly, but user-side `async for` loops hung indefinitely after the final token.
+* **Root Cause**: Inline completion code inside `_execute_prefill` and `_execute_decode` freed KV slots and set `completion_event`, but failed to push the `_END_OF_STREAM` sentinel onto `req.token_queue`.
+* **Solution**: Collapsed all completion logic into `_finish_request()`. Both successful completions (EOS / Max Tokens) and runtime errors now call `_finish_request()`, ensuring `_END_OF_STREAM` is placed on the queue.
+
+```python
+def _finish_request(self, slot_idx: int, reason: str, error: Optional[Exception] = None):
+    req = self.active_slots[slot_idx]
+    if req is None:
+        return
+    req.error = error
+    req.completion_event.set()
+    req.token_queue.put_nowait(_END_OF_STREAM) # Unblocks async consumer
+    self.kv_cache.free_batch_slot(slot_idx)
+    self.active_slots[slot_idx] = None
+```
+### 4.7 GPU Stalls during Sampling (O(N) CPU-GPU Synchronizations)
+* **Problem**: Initial sampling implementation used Python loops across batch rows, calling `.item()` on individual row tensors for argmax or multinomial steps.
+* **Root Cause**: Calling `.item()` on a CUDA tensor forces a synchronous host-device memory transfer, stalling the CUDA stream on every active request during every decode step.
+* **Solution**: Vectorized `_sample_next_token()` using batched PyTorch tensor operations across `dim=0` (temperature scaling, top-k masking, cumulative top-p filtering, and batched multinomial sampling), extracting the result with a single `.tolist()` call at the end.
+
+### 4.8. Multi-Byte UTF-8 Streaming Corruption
+* **Problem**: Streaming raw token IDs directly to stdout caused occasional garbled characters when multi-byte UTF-8 sequences (such as emojis or non-ASCII characters) were split across token boundaries.
+* **Root Cause**: Calling `tokenizer.decode([token_id])` on a fractional byte sequence produces replacement characters (`�`).
+* **Solution**: Implemented accumulated token buffering in the consumer: the client accumulates `generated_ids`, decodes the entire sequence using `tokenizer.decode(generated_ids, skip_special_tokens=True)`, and prints only the new string diff (`text[printed_len:]`).
+
+---
+
+## File Map
+
+- **`engine/scheduler.py`**: Continuous batching scheduler, request queuing, prefill/decode dispatching, and vectorized sampling.
+- **`engine/cache_manager.py`**: Paged KV Cache block allocation and physical slot management.
+- **`engine/loader.py`**: Safetensors parser and state dict translation mapping.
+- **`models/qwen_25.py`**: Qwen2.5 neural network topology with RoPE embeddings and Paged Attention hooks.
+- **`main.py`**: Entry point executing concurrent streaming tasks.
+
 ---
 
 ## 5. Conclusion and Next Steps
@@ -64,7 +154,4 @@ Building an engine from scratch is an exercise in precision. While compilation e
 The completion of this pipeline marks the successful deployment of a high-performance, continuously batching FP16 engine capable of running Qwen2.5-0.5B locally with near-zero overhead. 
 
 **Future Roadmap:**
-1.  **Streaming Outputs:** Implementing an asynchronous generator to yield tokens back to the client in real-time.
-2.  **Quantization:** Extending the custom kernels to support INT8/INT4 weight-only quantization to further reduce the VRAM footprint and increase memory bandwidth utilization.
-3. **Sampling:** Currently the engine uses greedy search using argmax we need to add sampling support with p, temp, top-k also repeat penalty (qwen-2.5-0.5B hallucinates and gets stuck in a loop).
-4. **Vectorization:** Currently for loops during decoding phase slows and adds memory overhead as a result compute is not utilized properly
+1.  **Quantization:** Extending the custom kernels to support INT8/INT4 weight-only quantization to further reduce the VRAM footprint and increase memory bandwidth utilization.

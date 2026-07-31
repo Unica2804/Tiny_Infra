@@ -3,8 +3,8 @@ from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 sources = [
-    os.path.join('source', 'attention_binding.cpp'),
-    os.path.join('source', 'attention.cu')
+    os.path.join('src', 'attention_binding.cpp'),
+    os.path.join('src', 'attention.cu')
 ]
 
 setup(

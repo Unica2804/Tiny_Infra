@@ -55,6 +55,14 @@ class ContinuousBatcher:
         p_value: float = 0.9,
         top_k: int = 20
     ) -> AsyncGenerator[int, None]:
+
+        # Guard against exceeding the maximum sequence length
+        if len(prompt_tokens) >= self.kv_cache.max_seq_len:
+            raise ValueError(
+                f"Prompt length ({len(prompt_tokens)}) exceeds or matches maximum "
+                f"allowed sequence length ({self.kv_cache.max_seq_len})."
+            )
+
         # Create a new generation request
         request = GenerationRequest(prompt_tokens, max_new_tokens, temperature, p_value, top_k)
         # Add the request to the queue
@@ -100,43 +108,52 @@ class ContinuousBatcher:
 
         # Applies Temperature, Top-K, and Top-P sampling to the logits for each request in the batch and returns the sampled next token IDs.
         next_token_logits = logits[:, -1, :].clone()
+        batch_size, vocab_size = next_token_logits.shape
         next_tokens = []
 
-        for row_idx, req in enumerate(requests):
-            row_logits = next_token_logits[row_idx : row_idx + 1]
-            
-            # greedy sampling if temperature is 0.0
-            if req.temperature == 0.0:
-                token_id = torch.argmax(row_logits, dim=-1).item()
-                next_tokens.append(token_id)
-                continue
-            row_logits = row_logits / req.temperature
+        temps = torch.tensor([[req.temperature] for req in requests], device=self.device, dtype=logits.dtype) 
+        
+        safe_temps = torch.where(temps == 0.0, 1.0, temps)
+        next_token_logits = next_token_logits / safe_temps
 
-            # Top-K sampling
-            if req.top_k > 0 and req.top_k < row_logits.size(-1):
-                top_k_values= min(req.top_k, row_logits.size(-1))
-                k_th_val,_ = torch.topk(row_logits, top_k_values, dim=-1)
-                min_top_k = k_th_val[:, -1:]
-                row_logits[row_logits < min_top_k] = float('-inf')
+        top_k_values = [min(req.top_k, vocab_size) if req.top_k > 0 else vocab_size for req in requests]   
+        max_k = max(top_k_values)
+
+        # Top-K sampling
+        if max_k < vocab_size:
+            top_k_logits, _ = torch.topk(next_token_logits, max_k, dim=-1)
+            # Create row mask for varying top_k parameters per request
+            k_mask = torch.arange(max_k, device=self.device).unsqueeze(0) < torch.tensor(top_k_values, device=self.device).unsqueeze(1)
+            # Replace masked out top_k positions with -inf
+            cutoff_per_row = torch.full((batch_size, 1), float('-inf'), device=self.device, dtype=logits.dtype)
+            cutoff_per_row = torch.where(k_mask, top_k_logits, cutoff_per_row).min(dim=-1, keepdim=True).values
+            next_token_logits[next_token_logits < cutoff_per_row] = float('-inf')
             
-            # P_value (nucleus) sampling
-            if req.p_value < 1.0:
-                sorted_logits, sorted_indices = torch.sort(row_logits, descending=True)
-                sorted_probs = torch.softmax(sorted_logits, dim=-1)
-                cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-                # Shift the cumulative probabilities to the right to keep the first token above threshold
-                sorted_indices_to_remove = cumulative_probs > req.p_value
-                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-                sorted_indices_to_remove[..., 0] = False
-                # Scatter mask back to the original indices
-                indices_to_remove = sorted_indices_to_remove.scatter(
-                    dim=-1, index=sorted_indices, src=sorted_indices_to_remove
-                )
-                row_logits[indices_to_remove] = float('-inf')
-            probs = torch.softmax(row_logits, dim=-1)
-            token_id = torch.multinomial(probs, num_samples=1).item()
-            next_tokens.append(token_id)
-        return next_tokens
+        # P_value (nucleus) sampling
+        p_values = torch.tensor([req.p_value for req in requests], device=self.device, dtype=logits.dtype)
+        if (p_values < 1.0).any():
+            sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True, dim=-1)
+            sorted_probs = torch.softmax(sorted_logits, dim=-1)
+            cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+            # Shift the cumulative probabilities to the right to keep the first token above threshold
+            sorted_indices_to_remove = cumulative_probs > p_values.unsqueeze(1)
+            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+            sorted_indices_to_remove[..., 0] = False
+            # Scatter mask back to the original indices
+            indices_to_remove = sorted_indices_to_remove.scatter(
+                dim=-1, index=sorted_indices, src=sorted_indices_to_remove
+            )
+            next_token_logits[indices_to_remove] = float('-inf')
+        
+        #Greedy vs. Multinomial Sampling
+        probs = torch.softmax(next_token_logits, dim=-1)
+        
+        # Batched multinomial sampling
+        sampled_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
+        greedy_tokens = torch.argmax(next_token_logits, dim=-1)
+        is_greedy = (temps.squeeze(-1) == 0.0)
+        final_tokens = torch.where(is_greedy, greedy_tokens, sampled_tokens)
+        return final_tokens.tolist()
 
     # helper to pull requests from the queue and fill the active slots
     def _fill_active_slots(self):
@@ -163,8 +180,7 @@ class ContinuousBatcher:
         for slot_idx, req in enumerate(self.active_slots):
             # Check if the slot has an active request
             if req is not None:
-                # Append the slot index to the list of active indices
-                # active_indices.append(slot_idx)
+                
                 # Check if the req is new or does it needs processing
                 if not req.is_prefilled:
                     prefill_indices.append(slot_idx) 
@@ -191,7 +207,7 @@ class ContinuousBatcher:
 
     def _finish_request(self, slot_idx:int, reason:str, error: Optional[Exception]=None):
         req = self.active_slots[slot_idx]
-        if req is not None:
+        if req is None:
             return
         req.error = error
         req.completion_event.set()
@@ -226,12 +242,7 @@ class ContinuousBatcher:
 
         if hit_eos or hit_max_tokens:
             stop_reason = "EOS Token" if hit_eos else "Max Tokens"
-            print(f"Request in slot {slot_idx} completed immediately during prefill ({stop_reason}).")
-            req.completion_event.set()
-            
-            # Wipe the fragment block tables
-            self.kv_cache.free_batch_slot(slot_idx)
-            self.active_slots[slot_idx] = None
+            self._finish_request(slot_idx, reason=f"prefill ({stop_reason})")
         else:
             # Only flag for the decode phase if generation needs to continue
             req.is_prefilled = True
@@ -259,16 +270,12 @@ class ContinuousBatcher:
         for i, slot_idx in enumerate(decode_indices):
             req = self.active_slots[slot_idx]
             new_token = next_tokens[i]
-            req.generated_tokens.append(next_tokens[i])
-            req.token_queue.put_nowait(next_tokens[i])
+            req.generated_tokens.append(new_token)
+            req.token_queue.put_nowait(new_token)
 
             hit_eos = (self.eos_token_id is not None) and (new_token == self.eos_token_id)
             hit_max_tokens = len(req.generated_tokens) >= req.max_new_tokens
 
             if hit_eos or hit_max_tokens:
-                # Mark the request as complete and set the completion event
-                print(f"Request in slot {slot_idx} has completed generation.")
-                req.completion_event.set()
-                # dynamically wipe the fragment block tables
-                self.kv_cache.free_batch_slot(slot_idx)
-                self.active_slots[slot_idx] = None
+                stop_reason = "EOS Token" if hit_eos else "Max Tokens"
+                self._finish_request(slot_idx, reason=stop_reason)

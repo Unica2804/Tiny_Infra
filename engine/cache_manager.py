@@ -67,8 +67,6 @@ class KVCacheManager:
 
         # Extract the incoming sequence length for the specified batch indices
         incoming_seq_len = new_keys.size(2)
-        # grab the current sequence lengths for the specic user batch indices
-        # current_seq_len = self.seq_len[batch_indices]
 
         # iterate through each users request active in the current batch_indices
 
