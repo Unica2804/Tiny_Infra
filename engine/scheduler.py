@@ -1,5 +1,5 @@
 # This is responsible for scheduling the inference tasks across available resources.
-
+import time
 import asyncio
 import torch
 from typing import List, Optional, AsyncGenerator
@@ -20,6 +20,10 @@ class GenerationRequest:
         self.completion_event = asyncio.Event()
         self.error = None
         self.is_prefilled = False
+        self.created_at: float = time.monotonic()
+        self.first_token_at: Optional[float] = None
+        self.last_token_at: Optional[float] = None
+
 
 class ContinuousBatcher:
     def __init__(self, model:Qwen2ForCausalLM, kv_cache:KVCacheManager, eos_token_id: Optional[int]=None):
@@ -32,6 +36,15 @@ class ContinuousBatcher:
         self.device = kv_cache.device
         self.cos_cache, self.sin_cache = self._init_rope_cache()
         self.eos_token_id = eos_token_id
+        # Engine-Level Throughput Tracking (vLLM style)
+        self.report_interval: float = 1.0  # seconds
+        self.throughput_window_start: float = time.monotonic()
+        # Window counters (resets every report_interval)
+        self.window_prefill_tokens: int = 0
+        self.window_decode_tokens: int = 0
+        # Cumulative lifetime counters
+        self.total_prefill_tokens: int = 0
+        self.total_decode_tokens: int = 0
     
     def _init_rope_cache(self):
         # precompute the RoPE cache for the model and store it in the KVCacheManager
@@ -46,6 +59,20 @@ class ContinuousBatcher:
         cos = freqs.cos().to(torch.float32)
         sin = freqs.sin().to(torch.float32)
         return cos, sin
+    
+    def _record_token_emission(self, req: GenerationRequest, token_id: int):
+        now = time.monotonic()
+        
+        # Capture Time to First Token (TTFT) anchor once
+        if req.first_token_at is None:
+            req.first_token_at = now
+            
+        # Continuously update last token timestamp
+        req.last_token_at = now
+        
+        # Append and push token
+        req.generated_tokens.append(token_id)
+        req.token_queue.put_nowait(token_id)
     
     async def generate_stream(
         self,
@@ -100,7 +127,41 @@ class ContinuousBatcher:
                 # If there is no active requests briefly yield control to avoid cpu cycles
                 await asyncio.sleep(0.01)
             # Yield control to the event loop to allow generation requests again.
+            self._report_throughput()
+
             await asyncio.sleep(0)
+    
+    def _report_throughput(self):
+        now = time.monotonic()
+        elapsed = now - self.throughput_window_start
+
+        if elapsed >= self.report_interval:
+            if self.device.type == "cuda":
+                torch.cuda.synchronize()
+            
+            # Recalculate 'now' post-synchronization for exact timing accuracy
+            now = time.monotonic()
+            elapsed = now - self.throughput_window_start
+            # Calculate rolling rates
+            prefill_rate = self.window_prefill_tokens / elapsed
+            decode_rate = self.window_decode_tokens / elapsed
+            total_rate = (self.window_prefill_tokens + self.window_decode_tokens) / elapsed
+
+            active_req_count = sum(1 for req in self.active_slots if req is not None)
+
+            # Print rolling throughput log (only if there was activity)
+            if self.window_prefill_tokens > 0 or self.window_decode_tokens > 0:
+                print(
+                    f"📊 [Engine Stats] Active Slots: {active_req_count}/{self.max_batch_size} | "
+                    f"Decode: {decode_rate:.1f} tok/s | Prefill: {prefill_rate:.1f} tok/s | "
+                    f"Total: {total_rate:.1f} tok/s"
+                )
+
+            # Reset window state
+            self.window_prefill_tokens = 0
+            self.window_decode_tokens = 0
+            self.throughput_window_start = now
+
     def _sample_next_token(
         self,
         logits: torch.Tensor,
@@ -189,18 +250,25 @@ class ContinuousBatcher:
 
         # phase-1 prefill
         # process prefill requests individually
+        successful_prefills = 0
         for slot_idx in prefill_indices:
             try:
                 self._execute_prefill(slot_idx)
+                successful_prefills += 1
             except Exception as e:
                 self._finish_request(slot_idx, reason="Error during prefill", error=e)
             
-        
+        self.window_prefill_tokens += successful_prefills
+        self.total_prefill_tokens += successful_prefills
+
         # phase-2 decode
         # we batch all decode requests together for efficiency to maximize paged_attn
         if decode_indices:
             try:
                 self._execute_decode(decode_indices)
+                successful_decodes = len(decode_indices)
+                self.window_decode_tokens += successful_decodes
+                self.total_decode_tokens += successful_decodes
             except Exception as e:
                 for slot_idx in decode_indices:
                     self._finish_request(slot_idx, reason="Error during decode", error=e)
@@ -219,7 +287,28 @@ class ContinuousBatcher:
         if error:
             print(f"Slot {slot_idx} request terminated due to error: {error}")
         else:
-            print(f"Slot {slot_idx} request completed successfully due to: {reason}")
+            total_tokens = len(req.generated_tokens)
+            
+            # Compute TTFT (Queueing time + Prefill latency)
+            ttft = (req.first_token_at - req.created_at) if req.first_token_at else 0.0
+            
+            # Compute Decode Throughput (excluding prefill token)
+            decode_tokens = total_tokens - 1
+            decode_time = (req.last_token_at - req.first_token_at) if (req.last_token_at and req.first_token_at) else 0.0
+            
+            if decode_tokens > 0 and decode_time > 0:
+                decode_tok_per_sec = f"{decode_tokens / decode_time:.2f} tok/s"
+            else:
+                decode_tok_per_sec = "N/A"
+
+            # Total wall time (created_at -> last_token_at)
+            total_time = (req.last_token_at - req.created_at) if req.last_token_at else 0.0
+            total_tok_per_sec = f"{total_tokens / total_time:.2f} tok/s" if total_time > 0 else "N/A"
+
+            print(
+                f"✅ [Slot {slot_idx}] Done ({reason}) | Tokens: {total_tokens} | "
+                f"TTFT: {ttft*1000:.1f}ms | Decode: {decode_tok_per_sec} | Overall: {total_tok_per_sec}"
+            )
 
     def _execute_prefill(self, slot_idx:int):
         req = self.active_slots[slot_idx]
@@ -234,8 +323,9 @@ class ContinuousBatcher:
         self.kv_cache.seq_len[batch_indices] += input_idx.size(1)
         # grab the prediction for the final token in the prompt
         next_token = self._sample_next_token(logits, [req])[0]
-        req.generated_tokens.append(next_token)
-        req.token_queue.put_nowait(next_token)
+        self._record_token_emission(req, next_token)
+        # req.generated_tokens.append(next_token)
+        # req.token_queue.put_nowait(next_token)
 
         hit_eos = (self.eos_token_id is not None) and (next_token == self.eos_token_id)
         hit_max_tokens = len(req.generated_tokens) >= req.max_new_tokens
@@ -270,8 +360,9 @@ class ContinuousBatcher:
         for i, slot_idx in enumerate(decode_indices):
             req = self.active_slots[slot_idx]
             new_token = next_tokens[i]
-            req.generated_tokens.append(new_token)
-            req.token_queue.put_nowait(new_token)
+            self._record_token_emission(req, new_token)
+            # req.generated_tokens.append(new_token)
+            # req.token_queue.put_nowait(new_token)
 
             hit_eos = (self.eos_token_id is not None) and (new_token == self.eos_token_id)
             hit_max_tokens = len(req.generated_tokens) >= req.max_new_tokens

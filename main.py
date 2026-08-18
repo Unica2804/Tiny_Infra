@@ -86,7 +86,7 @@ async def run_inference():
     task1 = asyncio.create_task(consume_stream("1", stream_1, tokenizer))
     task2 = asyncio.create_task(consume_stream("2", stream_2, tokenizer))
 
-    await asyncio.gather(task1, task2)
+    await asyncio.gather(task2)
     # # Wait for both to finish
     # results = await asyncio.gather(task1, task2)
 
