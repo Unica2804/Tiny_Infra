@@ -9,8 +9,8 @@ import math
 import torch.nn.functional as F
 from engine.cache_manager import KVCacheManager
 import engine.ops.custom_paged_attn as custom_paged_attn
-import engine.ops.custom_swiglu as custom_swiglu
 import engine.ops.custom_rope as custom_rope
+from kernels.fused_mlp import fused_mlp_forward
 
 class RmsNorm(nn.Module):
     def __init__(self, hidden_size: int, eps: float = 1e-6) -> torch.Tensor:
@@ -137,18 +137,21 @@ class Qwen2MLP(nn.Module):
         self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
         self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Compute the gated activation using the gate projection and Swilu activation function
-        gated_states = self.gate_proj(x)
-        # Compute the up projection of the input
-        up_states = self.up_proj(x)
+    def forward(self, x: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
+        # Flatten batch/seq dims for the fused 2D kernels
+        original_shape = x.shape
+        x_2d = x.view(-1, x.shape[-1])
+        residual_2d = residual.view(-1, residual.shape[-1])
 
-        fused_states = torch.cat([gated_states, up_states], dim=-1)
-        # Hardware accelerated Swilu activation function
-        swilu_output = custom_swiglu.forward(fused_states)
-
-        # Down project 
-        return self.down_proj(swilu_output)
+        # Single fused pass: gate/up GEMM + SwiGLU + down GEMM + residual
+        out_2d = fused_mlp_forward(
+            x_2d,
+            self.gate_proj.weight,
+            self.up_proj.weight,
+            self.down_proj.weight,
+            residual_2d,
+        )
+        return out_2d.view(*original_shape[:-1], self.down_proj.out_features)
 
 class Qwen2DecodeLayer(nn.Module):
     def __init__(self, config: QwenConfig) -> None:
@@ -185,10 +188,8 @@ class Qwen2DecodeLayer(nn.Module):
         residual = hidden_states
         # Apply RMS normalization to the hidden states after self-attention
         hidden_states = self.post_attention_layernorm(hidden_states)
-        # Apply the MLP to the normalized hidden states
-        hidden_states = self.mlp(hidden_states)
-        # Add the residual connection to the output of the MLP
-        hidden_states = hidden_states + residual
+        # Apply the MLP to the normalized hidden states (fused down projection + residual)
+        hidden_states = self.mlp(hidden_states, residual)
         return hidden_states
 
 class Qwen2Model(nn.Module):
