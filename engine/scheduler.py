@@ -165,33 +165,48 @@ class ContinuousBatcher:
     def _sample_next_token(
         self,
         logits: torch.Tensor,
-        requests: List[GenerationRequest]) -> List[int]:
+        requests: List[GenerationRequest]
+        ) -> List[int]:
 
-        # Applies Temperature, Top-K, and Top-P sampling to the logits for each request in the batch and returns the sampled next token IDs.
+        # Applies Temperature, Top-K, and Top-P sampling 
         next_token_logits = logits[:, -1, :].clone()
         batch_size, vocab_size = next_token_logits.shape
-        next_tokens = []
+        temperature_values = []
+        top_k_values = []
+        p_values = []
+        for req in requests:
+            temperature_values.append(req.temperature)
+            top_k_values.append(min(req.top_k, vocab_size) if req.top_k > 0 else vocab_size)
+            p_values.append(req.p_value)
 
-        temps = torch.tensor([[req.temperature] for req in requests], device=self.device, dtype=logits.dtype) 
+        temps = torch.tensor(
+            temperature_values, device=self.device, dtype=logits.dtype
+        ).unsqueeze(1)
+        top_k_tensor = torch.tensor(top_k_values, device=self.device, dtype=torch.long)
+        p_values = torch.tensor(p_values, device=self.device, dtype=logits.dtype)
         
         safe_temps = torch.where(temps == 0.0, 1.0, temps)
         next_token_logits = next_token_logits / safe_temps
 
-        top_k_values = [min(req.top_k, vocab_size) if req.top_k > 0 else vocab_size for req in requests]   
-        max_k = max(top_k_values)
+        restricted_top_k = [top_k for top_k in top_k_values if top_k < vocab_size]
+        max_k = max(restricted_top_k, default=vocab_size)
 
         # Top-K sampling
-        if max_k < vocab_size:
+        if restricted_top_k:
             top_k_logits, _ = torch.topk(next_token_logits, max_k, dim=-1)
             # Create row mask for varying top_k parameters per request
-            k_mask = torch.arange(max_k, device=self.device).unsqueeze(0) < torch.tensor(top_k_values, device=self.device).unsqueeze(1)
+            k_mask = torch.arange(max_k, device=self.device).unsqueeze(0) < top_k_tensor.unsqueeze(1)
             # Replace masked out top_k positions with -inf
             cutoff_per_row = torch.full((batch_size, 1), float('-inf'), device=self.device, dtype=logits.dtype)
             cutoff_per_row = torch.where(k_mask, top_k_logits, cutoff_per_row).min(dim=-1, keepdim=True).values
-            next_token_logits[next_token_logits < cutoff_per_row] = float('-inf')
+            restricted_rows = top_k_tensor < vocab_size
+            next_token_logits[restricted_rows] = torch.where(
+                next_token_logits[restricted_rows] < cutoff_per_row[restricted_rows],
+                float('-inf'),
+                next_token_logits[restricted_rows],
+            )
             
         # P_value (nucleus) sampling
-        p_values = torch.tensor([req.p_value for req in requests], device=self.device, dtype=logits.dtype)
         if (p_values < 1.0).any():
             sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True, dim=-1)
             sorted_probs = torch.softmax(sorted_logits, dim=-1)
