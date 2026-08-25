@@ -1,32 +1,51 @@
 # This is responsible for scheduling the inference tasks across available resources.
 import time
 import asyncio
+import logging
 import torch
 from typing import List, Optional, AsyncGenerator
 from models.qwen_25 import Qwen2ForCausalLM
 from engine.cache_manager import KVCacheManager
 
-_END_OF_STREAM = object()  # Sentinel value to indicate the end of a stream
+logger = logging.getLogger("inference_engine")
+_END_OF_STREAM = object()  
+
 # Class to hold user generation request information
 class GenerationRequest:
-    def __init__(self, prompt_tokens:List[int], max_new_tokens:int, temperature:float = 0.7, p_value: float = 0.9, top_k:int = 20):
+    def __init__(
+        self,
+        prompt_tokens:List[int],
+        max_new_tokens:int,
+        temperature:float = 0.7,
+        p_value: float = 0.9,
+        top_k:int = 20
+    ):
+
         self.prompt_tokens = prompt_tokens
         self.max_new_tokens = max_new_tokens
         self.temperature = temperature
         self.p_value = p_value
         self.top_k = top_k
-        self.generated_tokens = []
+
+        self.generated_tokens: List[int] = []
         self.token_queue = asyncio.Queue()
         self.completion_event = asyncio.Event()
-        self.error = None
-        self.is_prefilled = False
+        self.error: Optional[Exception] = None
+        self.is_prefilled: bool = False
+        self.is_cancelled: bool = False
+
         self.created_at: float = time.monotonic()
         self.first_token_at: Optional[float] = None
         self.last_token_at: Optional[float] = None
 
 
 class ContinuousBatcher:
-    def __init__(self, model:Qwen2ForCausalLM, kv_cache:KVCacheManager, eos_token_id: Optional[int]=None):
+    def __init__(
+        self,
+        model:Qwen2ForCausalLM,
+        kv_cache:KVCacheManager,
+        eos_token_id: Optional[int]=None
+    ):
         self.model = model
         self.kv_cache = kv_cache
         self.requests_queue: asyncio.Queue[GenerationRequest] = asyncio.Queue()
@@ -95,14 +114,19 @@ class ContinuousBatcher:
         # Add the request to the queue
         await self.requests_queue.put(request)
 
-        while True:
-            # Wait for the next token to be available in the token queue
-            next_token = await request.token_queue.get()
-            if next_token is _END_OF_STREAM:
-                if request.error is not None:
-                    raise request.error
-                break
-            yield next_token
+        try:
+            while True:
+                # Wait for the next token to be available in the token queue
+                next_token = await request.token_queue.get()
+                if next_token is _END_OF_STREAM:
+                    if request.error is not None:
+                        raise request.error
+                    break
+                yield next_token
+        except (GeneratorExit, asyncio.CancelledError):
+            request.is_cancelled = True
+            logger.info("Generation stream cancelled by client. Marking request as cancelled.")
+            raise
 
 
     async def generate(self, prompt_tokens:List[int], max_new_tokens:int, temperature:float = 0.7, p_value: float = 0.9, top_k:int = 20)-> List[int]:
@@ -114,7 +138,7 @@ class ContinuousBatcher:
         return tokens
 
     async def run_loop(self):
-        print("Continious batcher engine has started and monitors the requests queue for incoming generation requests.")
+        logger.info("ContinuousBatcher background loop started.")
         while True:
             # Try to fill the active slots with requests from the queue
             self._fill_active_slots()
@@ -126,9 +150,8 @@ class ContinuousBatcher:
             else:
                 # If there is no active requests briefly yield control to avoid cpu cycles
                 await asyncio.sleep(0.01)
-            # Yield control to the event loop to allow generation requests again.
+            
             self._report_throughput()
-
             await asyncio.sleep(0)
     
     def _report_throughput(self):
@@ -139,22 +162,21 @@ class ContinuousBatcher:
             if self.device.type == "cuda":
                 torch.cuda.synchronize()
             
-            # Recalculate 'now' post-synchronization for exact timing accuracy
+            
             now = time.monotonic()
             elapsed = now - self.throughput_window_start
-            # Calculate rolling rates
+            
             prefill_rate = self.window_prefill_tokens / elapsed
             decode_rate = self.window_decode_tokens / elapsed
             total_rate = (self.window_prefill_tokens + self.window_decode_tokens) / elapsed
 
             active_req_count = sum(1 for req in self.active_slots if req is not None)
 
-            # Print rolling throughput log (only if there was activity)
+            
             if self.window_prefill_tokens > 0 or self.window_decode_tokens > 0:
-                print(
-                    f"📊 [Engine Stats] Active Slots: {active_req_count}/{self.max_batch_size} | "
-                    f"Decode: {decode_rate:.1f} tok/s | Prefill: {prefill_rate:.1f} tok/s | "
-                    f"Total: {total_rate:.1f} tok/s"
+                logger.info(
+                    f"[Throughput] Active Slots: {active_req_count}/{self.max_batch_size} | "
+                    f"Decode: {decode_rate:.1f} tok/s | Prefill: {prefill_rate:.1f} tok/s | Total: {total_rate:.1f} tok/s"
                 )
 
             # Reset window state
@@ -165,33 +187,58 @@ class ContinuousBatcher:
     def _sample_next_token(
         self,
         logits: torch.Tensor,
-        requests: List[GenerationRequest]) -> List[int]:
+        requests: List[GenerationRequest]
+        ) -> List[int]:
 
-        # Applies Temperature, Top-K, and Top-P sampling to the logits for each request in the batch and returns the sampled next token IDs.
+        # Applies Temperature, Top-K, and Top-P sampling 
         next_token_logits = logits[:, -1, :].clone()
         batch_size, vocab_size = next_token_logits.shape
-        next_tokens = []
+        temperature_values = []
+        top_k_values = []
+        p_values = []
 
-        temps = torch.tensor([[req.temperature] for req in requests], device=self.device, dtype=logits.dtype) 
+        for req in requests:
+            temperature_values.append(req.temperature)
+            top_k_values.append(min(req.top_k, vocab_size) if req.top_k > 0 else vocab_size)
+            p_values.append(req.p_value)
+
+        temps = torch.tensor(
+            temperature_values, device=self.device, dtype=logits.dtype
+        ).unsqueeze(1)
+        top_k_tensor = torch.tensor(top_k_values, device=self.device, dtype=torch.long)
+        p_values = torch.tensor(p_values, device=self.device, dtype=logits.dtype)
         
         safe_temps = torch.where(temps == 0.0, 1.0, temps)
         next_token_logits = next_token_logits / safe_temps
 
-        top_k_values = [min(req.top_k, vocab_size) if req.top_k > 0 else vocab_size for req in requests]   
-        max_k = max(top_k_values)
+        restricted_top_k = [top_k for top_k in top_k_values if top_k < vocab_size]
+        max_k = max(restricted_top_k, default=vocab_size)
 
         # Top-K sampling
-        if max_k < vocab_size:
+        if restricted_top_k:
             top_k_logits, _ = torch.topk(next_token_logits, max_k, dim=-1)
-            # Create row mask for varying top_k parameters per request
-            k_mask = torch.arange(max_k, device=self.device).unsqueeze(0) < torch.tensor(top_k_values, device=self.device).unsqueeze(1)
-            # Replace masked out top_k positions with -inf
-            cutoff_per_row = torch.full((batch_size, 1), float('-inf'), device=self.device, dtype=logits.dtype)
-            cutoff_per_row = torch.where(k_mask, top_k_logits, cutoff_per_row).min(dim=-1, keepdim=True).values
-            next_token_logits[next_token_logits < cutoff_per_row] = float('-inf')
+
+            restricted_rows = top_k_tensor < vocab_size
+            k = top_k_tensor.clamp(min=1, max=max_k)
+            k_idx = (k-1).unsqueeze(1)
+            cutoff_per_row = top_k_logits.gather(1, k_idx)
+            next_token_logits[restricted_rows] = next_token_logits[restricted_rows].masked_fill(
+                next_token_logits[restricted_rows] < cutoff_per_row[restricted_rows],
+                float('-inf'), 
+            )
+            # # Create row mask for varying top_k parameters per request
+            # k_mask = torch.arange(max_k, device=self.device).unsqueeze(0) < top_k_tensor.unsqueeze(1)
+            # # Replace masked out top_k positions with -inf
+            # cutoff_per_row = torch.full((batch_size, 1), float('-inf'), device=self.device, dtype=logits.dtype)
+            # cutoff_per_row = torch.where(k_mask, top_k_logits, cutoff_per_row).min(dim=-1, keepdim=True).values
+            # restricted_rows = top_k_tensor < vocab_size
+            # next_token_logits[restricted_rows] = torch.where(
+            #     next_token_logits[restricted_rows] < cutoff_per_row[restricted_rows],
+            #     float('-inf'),
+            #     next_token_logits[restricted_rows],
+            # )
             
         # P_value (nucleus) sampling
-        p_values = torch.tensor([req.p_value for req in requests], device=self.device, dtype=logits.dtype)
         if (p_values < 1.0).any():
             sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True, dim=-1)
             sorted_probs = torch.softmax(sorted_logits, dim=-1)
@@ -216,41 +263,37 @@ class ContinuousBatcher:
         final_tokens = torch.where(is_greedy, greedy_tokens, sampled_tokens)
         return final_tokens.tolist()
 
-    # helper to pull requests from the queue and fill the active slots
     def _fill_active_slots(self):
         for i in range(self.max_batch_size):
-            # Check if the current slot is empty and if there are pending requests in the queue
             if self.active_slots[i] is None and not self.requests_queue.empty():
-                # Retrievve a new request from queue without blocking the event loop
                 new_request = self.requests_queue.get_nowait()
-                # Assign the new request to the active slot
+                if new_request.is_cancelled:
+                    continue
                 self.active_slots[i] = new_request
-                print(f"Assigned new request to Cache slot {i}")
+                logger.info(f"Assigned new request to Cache slot {i}")
     
-    # helper to check if there are any active requests in the slots
+    
     def _has_active_requests(self) -> bool:
-        # Check if any of the active slots contain a request (i.e., are not None)
         return any(req is not None for req in self.active_slots)
     
     # Main method to calculate next token for all active requests
     def _step_generation(self):
-        # Create lists to hold active slots and corresponding tokens every tick
         prefill_indices = []
         decode_indices = []
-        # iterate through the active slots to gather the current tokens for each active request
         for slot_idx, req in enumerate(self.active_slots):
             # Check if the slot has an active request
             if req is not None:
-                
+                if req.is_cancelled:
+                    self._finish_request(slot_idx, reason="Cancelled by client")
+                    continue                
                 # Check if the req is new or does it needs processing
                 if not req.is_prefilled:
                     prefill_indices.append(slot_idx) 
                 else:
                     decode_indices.append(slot_idx) 
 
-        # phase-1 prefill
-        # process prefill requests individually
         successful_prefills = 0
+
         for slot_idx in prefill_indices:
             try:
                 self._execute_prefill(slot_idx)
@@ -261,7 +304,6 @@ class ContinuousBatcher:
         self.window_prefill_tokens += successful_prefills
         self.total_prefill_tokens += successful_prefills
 
-        # phase-2 decode
         # we batch all decode requests together for efficiency to maximize paged_attn
         if decode_indices:
             try:
@@ -285,7 +327,7 @@ class ContinuousBatcher:
         self.active_slots[slot_idx] = None
 
         if error:
-            print(f"Slot {slot_idx} request terminated due to error: {error}")
+            logger.error(f"Slot {slot_idx} request terminated due to error: {error}")
         else:
             total_tokens = len(req.generated_tokens)
             
@@ -295,19 +337,11 @@ class ContinuousBatcher:
             # Compute Decode Throughput (excluding prefill token)
             decode_tokens = total_tokens - 1
             decode_time = (req.last_token_at - req.first_token_at) if (req.last_token_at and req.first_token_at) else 0.0
-            
-            if decode_tokens > 0 and decode_time > 0:
-                decode_tok_per_sec = f"{decode_tokens / decode_time:.2f} tok/s"
-            else:
-                decode_tok_per_sec = "N/A"
+            decode_rate = f"{decode_tokens / decode_time:.2f} tok/s" if (decode_tokens>0 and decode_time>0) else "N/A"
 
-            # Total wall time (created_at -> last_token_at)
-            total_time = (req.last_token_at - req.created_at) if req.last_token_at else 0.0
-            total_tok_per_sec = f"{total_tokens / total_time:.2f} tok/s" if total_time > 0 else "N/A"
-
-            print(
-                f"✅ [Slot {slot_idx}] Done ({reason}) | Tokens: {total_tokens} | "
-                f"TTFT: {ttft*1000:.1f}ms | Decode: {decode_tok_per_sec} | Overall: {total_tok_per_sec}"
+            logger.info(
+                f"[Slot {slot_idx}] Completed ({reason}) | Tokens: {total_tokens} | "
+                f"TTFT: {ttft*1000:.1f}ms | Decode: {decode_rate}"
             )
 
     def _execute_prefill(self, slot_idx:int):
@@ -361,8 +395,6 @@ class ContinuousBatcher:
             req = self.active_slots[slot_idx]
             new_token = next_tokens[i]
             self._record_token_emission(req, new_token)
-            # req.generated_tokens.append(new_token)
-            # req.token_queue.put_nowait(new_token)
 
             hit_eos = (self.eos_token_id is not None) and (new_token == self.eos_token_id)
             hit_max_tokens = len(req.generated_tokens) >= req.max_new_tokens
