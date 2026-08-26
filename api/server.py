@@ -25,6 +25,7 @@ async def lifespan(app: FastAPI):
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
 
     model_path = "weights/qwen25_0.5b_extracted.safetensors"
+    model_name = model_path.split("/")[-1].split(".")[0]
     model = load_qwen(model_path, device=device).to(torch.float16)
     config = QwenConfig()
 
@@ -51,6 +52,7 @@ async def lifespan(app: FastAPI):
     app.state.kv_cache = kv_cache
     app.state.background_loop_task = background_task
     app.state.model = model
+    app.state.model_name = model_name
     
     logger.info("Inference Server initialized successfully.")
     yield

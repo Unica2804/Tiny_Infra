@@ -2,10 +2,19 @@ import json
 import logging
 from fastapi import APIRouter, Request, HTTPException
 from fastapi.responses import StreamingResponse
-from api.schema import GenerationRequest, GenerationResponse
+from api.schema import GenerationRequest, GenerationResponse, ServerInfoResponse
 
 router = APIRouter()
 logger = logging.getLogger("inference_engine")
+
+@router.get("/info", response_model=ServerInfoResponse)
+async def get_server_info(request: Request):
+    kv_cache = request.app.state.kv_cache
+    return ServerInfoResponse(
+        model_name=request.app.state.model_name,
+        max_seq_len=kv_cache.max_seq_len,
+        max_batch_size=request.app.state.scheduler.max_batch_size
+    )
 
 @router.post("/generate", response_model=None)
 async def generate_endpoint(payload: GenerationRequest, request: Request):
@@ -14,8 +23,9 @@ async def generate_endpoint(payload: GenerationRequest, request: Request):
     kv_cache = request.app.state.kv_cache
 
     # Apply chat template for qwen
+    raw_messages = [msg.model_dump() for msg in payload.messages]
     formatted_prompt = tokenizer.apply_chat_template(
-        [{"role": "user", "content": payload.prompt}],
+        raw_messages,
         tokenize = False,
         add_generation_prompt = True
     )
@@ -45,7 +55,8 @@ async def generate_endpoint(payload: GenerationRequest, request: Request):
             return GenerationResponse(
                 text=decoded_text,
                 tokens_generated=len(output_tokens),
-                prompt_tokens=len(tokens)
+                prompt_tokens=len(tokens),
+                finish_reason="stop"
             )
         except Exception as e:
             logger.error(f"Error during generation: {e}")
