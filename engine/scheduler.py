@@ -33,6 +33,7 @@ class GenerationRequest:
         self.error: Optional[Exception] = None
         self.is_prefilled: bool = False
         self.is_cancelled: bool = False
+        self.finish_reason: Optional[str] = None
 
         self.created_at: float = time.monotonic()
         self.first_token_at: Optional[float] = None
@@ -320,6 +321,7 @@ class ContinuousBatcher:
         if req is None:
             return
         req.error = error
+        req.finish_reason = "error" if error else reason
         req.completion_event.set()
         req.token_queue.put_nowait(_END_OF_STREAM)
 
