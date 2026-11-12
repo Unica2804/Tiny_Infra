@@ -1,11 +1,14 @@
 import json
 import logging
-from fastapi import APIRouter, Request, HTTPException
+
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from api.schema import GenerationRequest, GenerationResponse, ServerInfoResponse
+
+from tinyinfra.api.schema import GenerationRequest, GenerationResponse, ServerInfoResponse
 
 router = APIRouter()
 logger = logging.getLogger("inference_engine")
+
 
 @router.get("/info", response_model=ServerInfoResponse)
 async def get_server_info(request: Request):
@@ -13,8 +16,9 @@ async def get_server_info(request: Request):
     return ServerInfoResponse(
         model_name=request.app.state.model_name,
         max_seq_len=kv_cache.max_seq_len,
-        max_batch_size=request.app.state.scheduler.max_batch_size
+        max_batch_size=request.app.state.scheduler.max_batch_size,
     )
+
 
 @router.post("/generate", response_model=None)
 async def generate_endpoint(payload: GenerationRequest, request: Request):
@@ -25,9 +29,7 @@ async def generate_endpoint(payload: GenerationRequest, request: Request):
     # Apply chat template for qwen
     raw_messages = [msg.model_dump() for msg in payload.messages]
     formatted_prompt = tokenizer.apply_chat_template(
-        raw_messages,
-        tokenize = False,
-        add_generation_prompt = True
+        raw_messages, tokenize=False, add_generation_prompt=True
     )
     tokens = tokenizer.encode(formatted_prompt)
 
@@ -35,7 +37,7 @@ async def generate_endpoint(payload: GenerationRequest, request: Request):
     if len(tokens) >= kv_cache.max_seq_len:
         raise HTTPException(
             status_code=400,
-            detail=f"Prompt exceeds maximum context length of {kv_cache.max_seq_len}"
+            detail=f"Prompt exceeds maximum context length of {kv_cache.max_seq_len}",
         )
 
     # Non streaming response
@@ -46,34 +48,28 @@ async def generate_endpoint(payload: GenerationRequest, request: Request):
                 max_new_tokens=payload.max_new_tokens,
                 temperature=payload.temperature,
                 p_value=payload.p_value,
-                top_k=payload.top_k
+                top_k=payload.top_k,
             )
-            decoded_text = tokenizer.decode(
-                output_tokens,
-                skip_special_tokens=True
-            )
+            decoded_text = tokenizer.decode(output_tokens, skip_special_tokens=True)
             return GenerationResponse(
                 text=decoded_text,
                 tokens_generated=len(output_tokens),
                 prompt_tokens=len(tokens),
-                finish_reason="stop"
+                finish_reason="stop",
             )
         except Exception as e:
             logger.error(f"Error during generation: {e}")
-            raise HTTPException(
-                status_code=500,
-                detail="An error occurred during text generation."
-            )
-    
+            raise HTTPException(status_code=500, detail="An error occurred during text generation.")
+
     # Streaming response
     async def event_stream():
-        
+
         stream_gen = scheduler.generate_stream(
             prompt_tokens=tokens,
             max_new_tokens=payload.max_new_tokens,
             temperature=payload.temperature,
             p_value=payload.p_value,
-            top_k=payload.top_k
+            top_k=payload.top_k,
         )
         generated_ids = []
         printed_len = 0
@@ -83,30 +79,21 @@ async def generate_endpoint(payload: GenerationRequest, request: Request):
                     logger.info("Client disconnected, stopping generation.")
                     break
                 generated_ids.append(token_id)
-                full_text = tokenizer.decode(
-                    generated_ids,
-                    skip_special_tokens=True
-                )
+                full_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
                 new_text = full_text[printed_len:]
                 if new_text:
                     printed_len = len(full_text)
-                    chunk_data = json.dumps(
-                        {"text": new_text, "done":False}
-                    )
+                    chunk_data = json.dumps({"text": new_text, "done": False})
                     yield f"data: {chunk_data}\n\n"
             # Final chunk indicating completion
             yield f"data: {json.dumps({'text': '', 'done': True})}\n\n"
         except Exception as e:
-            logger.error(
-                f"Error during streaming generation: {e}"
-            )
-            error_data = json.dumps(
-                {"error": str(e), "done": True}
-            )
+            logger.error(f"Error during streaming generation: {e}")
+            error_data = json.dumps({"error": str(e), "done": True})
             yield f"data: {error_data}\n\n"
-    
+
     return StreamingResponse(
         event_stream(),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"}
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
     )

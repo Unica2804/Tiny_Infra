@@ -1,13 +1,20 @@
+import torch
 import triton
 import triton.language as tl
-import torch
 
 
 @triton.jit
 def fused_gateup_swiglu_kernel(
-    X, Wg, Wu, Y,
-    M, N, K,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    X,
+    Wg,
+    Wu,
+    Y,
+    M,
+    N,
+    K,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
     GROUP_M: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -55,9 +62,16 @@ def fused_gateup_swiglu_kernel(
 
 @triton.jit
 def fused_down_residual_kernel(
-    S, Wd, R, Y,
-    M, N, K,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    S,
+    Wd,
+    R,
+    Y,
+    M,
+    N,
+    K,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
     GROUP_M: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -93,8 +107,7 @@ def fused_down_residual_kernel(
     r_ptrs = R + offs_m[:, None] * N + offs_n[None, :]
     resid = tl.load(r_ptrs, mask=x_mask & (offs_n[None, :] < N), other=0.0)
     out = acc.to(S.dtype.element_ty) + resid
-    tl.store(Y + offs_m[:, None] * N + offs_n[None, :], out,
-             mask=x_mask & (offs_n[None, :] < N))
+    tl.store(Y + offs_m[:, None] * N + offs_n[None, :], out, mask=x_mask & (offs_n[None, :] < N))
 
 
 def fused_mlp_forward(
@@ -110,13 +123,31 @@ def fused_mlp_forward(
 
     S = torch.empty((M, N), device=X.device, dtype=X.dtype)
     fused_gateup_swiglu_kernel[(triton.cdiv(M, 64) * triton.cdiv(N, 64),)](
-        X, gate_w, up_w, S, M, N, K,
-        BLOCK_M=64, BLOCK_N=64, BLOCK_K=128, GROUP_M=8,
+        X,
+        gate_w,
+        up_w,
+        S,
+        M,
+        N,
+        K,
+        BLOCK_M=64,
+        BLOCK_N=64,
+        BLOCK_K=128,
+        GROUP_M=8,
     )
 
     Y = torch.empty((M, H), device=X.device, dtype=X.dtype)
     fused_down_residual_kernel[(triton.cdiv(M, 64) * triton.cdiv(H, 64),)](
-        S, down_w, residual, Y, M, H, N,
-        BLOCK_M=64, BLOCK_N=64, BLOCK_K=64, GROUP_M=8,
+        S,
+        down_w,
+        residual,
+        Y,
+        M,
+        H,
+        N,
+        BLOCK_M=64,
+        BLOCK_N=64,
+        BLOCK_K=64,
+        GROUP_M=8,
     )
     return Y

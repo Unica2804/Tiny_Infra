@@ -123,7 +123,7 @@ def _finish_request(self, slot_idx: int, reason: str, error: Optional[Exception]
         return
     req.error = error
     req.completion_event.set()
-    req.token_queue.put_nowait(_END_OF_STREAM) # Unblocks async consumer
+    req.token_queue.put_nowait(_END_OF_STREAM)  # Unblocks async consumer
     self.kv_cache.free_batch_slot(slot_idx)
     self.active_slots[slot_idx] = None
 ```

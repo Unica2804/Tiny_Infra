@@ -6,8 +6,12 @@ dist/
 wheels/
 *.egg-info
 .pytest_cache/
+.ruff_cache/
 
 # Virtual environments
 .venv
 weights/
 utils/fuse_weights.py
+*.so
+ROADMAP.md
+track.md

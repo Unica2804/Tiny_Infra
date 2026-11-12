@@ -1,16 +1,13 @@
-import sys
-import json
 import asyncio
+import json
+import sys
+
 import httpx
-from typing import List, Dict
 
 SERVER_URL = "http://localhost:8000"
 
-def prompt_param(
-    label:str,
-    default: float,
-    cast_type = float
-) -> float:
+
+def prompt_param(label: str, default: float, cast_type=float) -> float:
     user_val = input(f"{label} [{default}]: ").strip()
     if not user_val:
         return default
@@ -20,12 +17,13 @@ def prompt_param(
         print(f"Invalid input, using default {default}")
         return default
 
+
 async def main():
     print("==================================================")
     print("                   Tiny Infra TUI               ")
     print("==================================================")
 
-    async with httpx.AsyncClient(base_url = SERVER_URL, timeout=60.0) as client:
+    async with httpx.AsyncClient(base_url=SERVER_URL, timeout=60.0) as client:
         try:
             response = await client.get("/info")
             response.raise_for_status()
@@ -33,7 +31,7 @@ async def main():
         except Exception as e:
             print(f"Failed to fetch server info at {SERVER_URL}/info: {e}")
             return
-        
+
         server_max_seq_len = server_info["max_seq_len"]
         print(f"Connected to server: {server_info['model_name']}")
         print(f"Server max sequence length: {server_max_seq_len}")
@@ -46,11 +44,15 @@ async def main():
 
         budget = prompt_param("Conversation Budget (Tokens)", server_max_seq_len, int)
         conversation_budget = min(int(budget), server_max_seq_len)
-        print(f"\nSession initialized with a conversation budget of {conversation_budget} tokens.\n")
-        print("Type your message below. Commands: '/exit' to quit, '/clear' to clear the conversation.")
+        print(
+            f"\nSession initialized with a conversation budget of {conversation_budget} tokens.\n"
+        )
+        print(
+            "Type your message below. Commands: '/exit' to quit, '/clear' to clear the conversation."
+        )
 
-        #chat session state
-        messages: List[Dict[str,str]] = []
+        # chat session state
+        messages: list[dict[str, str]] = []
 
         while True:
             try:
@@ -74,7 +76,9 @@ async def main():
             total_chars = sum(len(msg["content"]) for msg in messages)
             estimated_tokens = int(total_chars / 3.5)
             if estimated_tokens + max_new_tokens >= conversation_budget:
-                print(f"[Warning] Context history (~{estimated_tokens} tokens) is approaching your budget of {conversation_budget} tokens.")
+                print(
+                    f"[Warning] Context history (~{estimated_tokens} tokens) is approaching your budget of {conversation_budget} tokens."
+                )
 
             payload = {
                 "messages": messages,
@@ -82,7 +86,7 @@ async def main():
                 "temperature": temperature,
                 "p_value": top_p,
                 "top_k": top_k,
-                "stream": True
+                "stream": True,
             }
             print("Assistant> ", end="", flush=True)
             accumulated_reply = []
@@ -91,7 +95,9 @@ async def main():
                 async with client.stream("POST", "/generate", json=payload) as response:
                     if response.status_code != 200:
                         error_detail = await response.aread()
-                        print(f"\n[Error] Server returned status code {response.status_code}: {error_detail.decode()}")
+                        print(
+                            f"\n[Error] Server returned status code {response.status_code}: {error_detail.decode()}"
+                        )
                         messages.pop()  # Remove the last user message on error
                         continue
                     async for line in response.aiter_lines():
@@ -113,13 +119,20 @@ async def main():
                 full_reply = "".join(accumulated_reply)
                 if full_reply:
                     messages.append({"role": "assistant", "content": full_reply})
-                print()    
+                print()
             except KeyboardInterrupt:
                 print("\n\n [Stream Interrupted by User]")
                 if accumulated_reply:
                     messages.append({"role": "assistant", "content": "".join(accumulated_reply)})
             except Exception as e:
                 print(f"\n Communication failure: {e}")
-                messages.pop()  
-if __name__ == "__main__":
+                messages.pop()
+
+
+def run() -> None:
+    """Console entry point for `tinyinfra-chat`."""
     asyncio.run(main())
+
+
+if __name__ == "__main__":
+    run()

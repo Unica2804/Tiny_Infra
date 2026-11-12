@@ -1,32 +1,79 @@
+[build-system]
+# Hatchling: standalone, modern, zero-config for src-layout packages.
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
-name = "inference_engine"
+name = "tinyinfra"
 version = "0.1.0"
-description = "Add your description here"
+description = "Custom, from-scratch LLM inference engine: paged KV cache, continuous batching, Triton kernels, SSE streaming, FastAPI server."
 readme = "README.md"
 requires-python = ">=3.13"
+keywords = ["llm", "inference", "qwen2", "triton", "paged-attention", "continuous-batching"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "torch",
-    "accelerate",
     "safetensors",
-    "numpy",
     "transformers",
-    "asyncio",
     "fastapi>=0.141.1",
     "pydantic>=2.13.4",
     "uvicorn>=0.52.4",
     "textual>=8.2.8",
     "httpx>=0.28.1",
 ]
-# Configure the PyTorch CUDA 12.8 wheel repository
-[[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
-explicit = true  # Prevents non-PyTorch packages from searching this index
 
-# Map PyTorch packages to pull strictly from the cu128 index
-[tool.uv.sources]
-torch = [{ index = "pytorch-cu128" }]
-torchvision = [{ index = "pytorch-cu128" }]
+[project.scripts]
+tinyinfra-serve = "tinyinfra.api.server:run"
+tinyinfra-chat = "tinyinfra.client.client:run"
+tinyinfra-tui = "tinyinfra.client.tui_client:run"
+
+[project.urls]
+Repository = "https://github.com/Unica2804/Tiny_Infra"
+Issues = "https://github.com/Unica2804/Tiny_Infra/issues"
+
+# PEP 735 dependency groups — uv syncs the dev group by default.
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.8",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tinyinfra"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src", "tests", "README.md", "ROADMAP.md", "pyproject.toml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-q"
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+
+[tool.ruff.lint]
+# Keep it lean: real bugs (F, E9), unused imports (F401), import sorting (I),
+# pyupgrade (UP), minus style nits we don't care about yet.
+select = ["E4", "E7", "E9", "F", "I", "UP"]
 
 [tool.uv]
 link-mode = "hardlink"
+
+# Torch is pinned to the cu128 builds on purpose: your driver reports CUDA 13.x
+# but the cu128 wheels bundle the 12.8 runtime they were built against, and that's
+# what this machine runs. If you ever bump the CUDA stack, change the index URL
+# and the sources below together with `uv lock` — never mix .so builds across kits.
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu128" }]

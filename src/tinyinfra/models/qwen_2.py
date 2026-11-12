@@ -1,20 +1,21 @@
-# Architecture for Qwen-2.5-0.5B. It uses the Qwen 2 Architecture
-# No use of fused operations, as it will be optimized using custom kernels for rtx2050 mobile gpu.
-# All operations used are primitive pytorch ops or linear layers, which can be fused later on.
-
 import torch
 import torch.nn as nn
-from models.config import QwenConfig
-import math
 import torch.nn.functional as F
-from engine.cache_manager import KVCacheManager
-import engine.ops.custom_paged_attn as custom_paged_attn
-import engine.ops.custom_rope as custom_rope
-from kernels.fused_mlp import fused_mlp_forward
+
+try:  # CUDA extensions were deleted in Phase 0; kernels return as Triton in Phase 2.
+    import tinyinfra.engine.ops.custom_paged_attn as custom_paged_attn
+except ModuleNotFoundError:
+    custom_paged_attn = None
+    custom_rope = None
+from tinyinfra.engine.cache_manager import KVCacheManager
+from tinyinfra.kernels.fused_mlp import fused_mlp_forward
+from tinyinfra.kernels.Rope import rope_inplace
+from tinyinfra.models.config import QwenConfig
+
 
 class RmsNorm(nn.Module):
     def __init__(self, hidden_size: int, eps: float = 1e-6) -> torch.Tensor:
-        
+
         super().__init__()
         # Initialize the weight parameter for the RMS normalization layer
         self.weight = nn.Parameter(torch.ones(hidden_size))
@@ -47,17 +48,17 @@ class Qwen2Attention(nn.Module):
         self.k_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=True)
         self.v_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=True)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
-    
+
     def forward(
-        self, 
-        hidden_states: torch.Tensor, 
-        pos_id: torch.tensor, 
+        self,
+        hidden_states: torch.Tensor,
+        pos_id: torch.tensor,
         layer_idx: int,
         batch_indices: torch.Tensor,
         kv_cache: "KVCacheManager",
         cos_cache: torch.Tensor,
-        sin_cache: torch.Tensor
-        ) -> torch.Tensor:
+        sin_cache: torch.Tensor,
+    ) -> torch.Tensor:
 
         # Extract the batch size, sequence length from the input hidden states
         batch_size, q_length, _ = hidden_states.size()
@@ -67,23 +68,25 @@ class Qwen2Attention(nn.Module):
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
-        # Transform the query, key, and value matrices to the shape (batch_size, num_heads, seq_length, head_dim)
+        # Transform (batch_size, num_heads, seq_length, head_dim)
         query_states = query_states.view(batch_size, q_length, self.num_heads, self.head_dim)
         key_states = key_states.view(batch_size, q_length, self.num_kv_heads, self.head_dim)
-        value_states = value_states.view(batch_size, q_length, self.num_kv_heads, self.head_dim)#.transpose(1, 2)
-        # flatten to 3D/1D for custom kernels
+        value_states = value_states.view(batch_size, q_length, self.num_kv_heads, self.head_dim)
+
+        # flatten to 3D/1D 
         query_3d = query_states.view(batch_size * q_length, self.num_heads, self.head_dim)
         key_3d = key_states.view(batch_size * q_length, self.num_kv_heads, self.head_dim)
         pos_id_flat = pos_id.reshape(-1).to(torch.int32)
-        # Hardware accelerated in place rope
-        custom_rope.apply_inplace(query_3d, key_3d, cos_cache, sin_cache, pos_id_flat)
         
+        # Hardware accelerated in place rope
+        rope_inplace(query_3d, key_3d, cos_cache, sin_cache, pos_id_flat)
+
         # Handover the cached key and value states to the KVCacheManager for updating and fetching
         block_tables, context_lens = kv_cache.allocate_and_insert(
-            layer_idx = layer_idx,
-            batch_indices = batch_indices,
-            new_keys = key_states.transpose(1,2),
-            new_values = value_states.transpose(1,2)
+            layer_idx=layer_idx,
+            batch_indices=batch_indices,
+            new_keys=key_states.transpose(1, 2),
+            new_values=value_states.transpose(1, 2),
         )
         # Execution router to route between prefill and decode
         if q_length > 1:
@@ -93,20 +96,18 @@ class Qwen2Attention(nn.Module):
             v_contig = value_states.repeat_interleave(num_repeats, dim=2)
 
             # SDPA expects shape: [batch_size, num_heads, seq_length, head_dim]
-            q_sdpa = query_states.transpose(1,2)
-            k_sdpa = k_contig.transpose(1,2)
-            v_sdpa = v_contig.transpose(1,2)
+            q_sdpa = query_states.transpose(1, 2)
+            k_sdpa = k_contig.transpose(1, 2)
+            v_sdpa = v_contig.transpose(1, 2)
 
             # Execute using pytorch scaled dot product attention with causal masking
-            attn_output = F.scaled_dot_product_attention(
-                q_sdpa, k_sdpa, v_sdpa, is_causal=True
-            )
-            attn_output = attn_output.transpose(1,2).contiguous()
+            attn_output = F.scaled_dot_product_attention(q_sdpa, k_sdpa, v_sdpa, is_causal=True)
+            attn_output = attn_output.transpose(1, 2).contiguous()
         else:
             # decode mode, we will use custom paged attention kernel
             # it expects a 3D Query tensor: [batch_size, num_heads, head_dim]
             query_states = query_states.squeeze(1)
-        
+
             # launch paged attention and allocate a output tensor
             attn_output = torch.empty_like(query_states)
 
@@ -121,13 +122,14 @@ class Qwen2Attention(nn.Module):
                 kv_cache.value_cache[layer_idx],
                 active_block_tables,
                 active_context_lens,
-                kv_cache.block_size
+                kv_cache.block_size,
             )
 
             # reshape and project back to hidden size
             attn_output = attn_output.unsqueeze(1)
         attn_output = attn_output.view(batch_size, q_length, self.hidden_size)
         return self.o_proj(attn_output)
+
 
 class Qwen2MLP(nn.Module):
     def __init__(self, config: QwenConfig) -> None:
@@ -153,6 +155,7 @@ class Qwen2MLP(nn.Module):
         )
         return out_2d.view(*original_shape[:-1], self.down_proj.out_features)
 
+
 class Qwen2DecodeLayer(nn.Module):
     def __init__(self, config: QwenConfig) -> None:
         super().__init__()
@@ -160,16 +163,16 @@ class Qwen2DecodeLayer(nn.Module):
         self.mlp = Qwen2MLP(config)
         self.input_layernorm = RmsNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RmsNorm(config.hidden_size, eps=config.rms_norm_eps)
-    
+
     def forward(
-        self, 
-        hidden_states: torch.Tensor, 
+        self,
+        hidden_states: torch.Tensor,
         pos_id: torch.tensor,
-        layer_idx: int, 
+        layer_idx: int,
         batch_indices: torch.tensor,
         kv_cache: "KVCacheManager",
         cos_cache: torch.Tensor,
-        sin_cache: torch.Tensor
+        sin_cache: torch.Tensor,
     ) -> torch.Tensor:
 
         # save a copy of the input hidden states for residual connection
@@ -192,6 +195,7 @@ class Qwen2DecodeLayer(nn.Module):
         hidden_states = self.mlp(hidden_states, residual)
         return hidden_states
 
+
 class Qwen2Model(nn.Module):
     def __init__(self, config: QwenConfig):
         super().__init__()
@@ -201,34 +205,39 @@ class Qwen2Model(nn.Module):
         # Create a list of decoder layers based on the number of layers specified in the configuration
         self.layers = nn.ModuleList([Qwen2DecodeLayer(config) for _ in range(config.num_layers)])
         # Initialize the final RMS normalization layer
-        self.norm = RmsNorm(config.hidden_size, eps=config.rms_norm_eps) 
-    
+        self.norm = RmsNorm(config.hidden_size, eps=config.rms_norm_eps)
+
     def forward(
-        self, 
+        self,
         input_ids: torch.Tensor,
         batch_indices: torch.Tensor,
         kv_cache: "KVCacheManager",
         cos_cache: torch.Tensor,
-        sin_cache: torch.Tensor
-        ) -> torch.Tensor:
+        sin_cache: torch.Tensor,
+    ) -> torch.Tensor:
 
         # extrat the seq_len and batch_size from the input_ids tensor
         seq_len = input_ids.size(1)
         batch_size = input_ids.size(0)
 
         start_positions = kv_cache.seq_len[batch_indices]
-        
+
         # Create a 2D pos_id tensor [batch_size, seq_len] offset by the cache length
-        base_positions = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, seq_len)
+        base_positions = (
+            torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, seq_len)
+        )
         pos_id = base_positions + start_positions.unsqueeze(1)
-        
+
         hidden_states = self.embed_tokens(input_ids)
 
         for layer_idx, layers in enumerate(self.layers):
             # Pass the hidden states through each decoder layer, along with position ids and attention mask
-            hidden_states = layers(hidden_states, pos_id, layer_idx, batch_indices, kv_cache, cos_cache, sin_cache)
+            hidden_states = layers(
+                hidden_states, pos_id, layer_idx, batch_indices, kv_cache, cos_cache, sin_cache
+            )
         # Apply the final RMS normalization to the output hidden states
         return self.norm(hidden_states)
+
 
 class Qwen2ForCausalLM(nn.Module):
     def __init__(self, config: QwenConfig):
@@ -238,13 +247,13 @@ class Qwen2ForCausalLM(nn.Module):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def forward(
-        self, 
-        input_ids: torch.Tensor, 
-        batch_indices: torch.Tensor, 
+        self,
+        input_ids: torch.Tensor,
+        batch_indices: torch.Tensor,
         kv_cache: "KVCacheManager",
         cos_cache: torch.Tensor,
-        sin_cache: torch.Tensor
-        ) -> torch.Tensor:
+        sin_cache: torch.Tensor,
+    ) -> torch.Tensor:
         # Pass the input_ids through the Qwen2 model to obtain hidden states
         hidden_states = self.model(input_ids, batch_indices, kv_cache, cos_cache, sin_cache)
         # Project the hidden states to the vocabulary size using the lm_head

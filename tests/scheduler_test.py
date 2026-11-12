@@ -1,11 +1,15 @@
 # Import the standard asyncio library to manage asynchronous tasks during testing
 import asyncio
-# Import the PyTorch library to create mock token and logit tensors
-import torch
-# Import pytest to define our unit test cases and fixtures
-import pytest
+
 # Import MagicMock from unittest to create lightweight mock objects for our neural network components
 from unittest.mock import MagicMock
+
+# Import pytest to define our unit test cases and fixtures
+import pytest
+
+# Import the PyTorch library to create mock token and logit tensors
+import torch
+
 # Import the classes we need to test from our scheduling module
 from inference_engine.scheduler import ContiniousBatcher, GenerationRequest
 
@@ -47,7 +51,7 @@ async def test_generation_request_initialization():
     prompt = [101, 102, 103]
     # Instantiate a brand new GenerationRequest tracking object requesting 5 new tokens
     request = GenerationRequest(prompt_tokens=prompt, max_new_tokens=5)
-    
+
     # Assert that the stored prompt matches the input list exactly
     assert request.prompt_tokens == prompt
     # Assert that the maximum new tokens limit is set correctly
@@ -69,15 +73,15 @@ async def test_fill_empty_slots(mock_model, mock_kv_cache):
     request1 = GenerationRequest([1, 2], max_new_tokens=2)
     # Define a second mock request object
     request2 = GenerationRequest([3, 4], max_new_tokens=2)
-    
+
     # Manually drop the first request into the asynchronous waiting queue
     await batcher.requests_queue.put(request1)
     # Manually drop the second request into the asynchronous waiting queue
     await batcher.requests_queue.put(request2)
-    
+
     # Execute the internal slot filling routine to pull requests from the queue
     batcher._fill_active_slots()
-    
+
     # Assert that physical Slot 0 is no longer empty and holds request1
     assert batcher.active_slots[0] is request1
     # Assert that physical Slot 1 is no longer empty and holds request2
@@ -93,13 +97,13 @@ async def test_step_engine_executes_prediction(mock_model, mock_kv_cache):
     batcher = ContiniousBatcher(model=mock_model, kv_cache=mock_kv_cache)
     # Instantiate a request tracking structure asking for exactly 1 new token
     request = GenerationRequest([10, 20], max_new_tokens=1)
-    
+
     # Assign the request manually to physical slot 0 to simulate an active user
     batcher.active_slots[0] = request
-    
+
     # Execute exactly one iteration of the neural network forward step
     batcher._step_generation()
-    
+
     # Assert that the mock model forward pass was successfully invoked by the engine
     assert mock_model.called
     # Assert that slot 0 was completely cleared and set to None because it completed its 1 requested token
@@ -117,27 +121,27 @@ async def test_step_engine_executes_prediction(mock_model, mock_kv_cache):
 async def test_continuous_batcher_end_to_end(mock_model, mock_kv_cache):
     # Instantiate the batcher engine using our mock neural network and memory components
     batcher = ContiniousBatcher(model=mock_model, kv_cache=mock_kv_cache)
-    
+
     # Launch the infinite background engine loop as a concurrent asynchronous task
     loop_task = asyncio.create_task(batcher.run_loop())
-    
+
     # Fire off an explicit generate request asking for 2 tokens and capture the awaitable future result
     gen_task = asyncio.create_task(batcher.generate([40, 50], max_new_tokens=2))
-    
+
     # Yield execution control briefly to allow the background loop task to catch the request, process it, and step
     await asyncio.sleep(0.05)
-    
+
     # Await the generation task to gather the final generated list of integers
     generated_output = await gen_task
-    
+
     # Assert that the output sequence contains exactly 2 tokens as requested
     assert len(generated_output) == 2
     # Assert that both predicted tokens correspond to the token ID 5 returned by our model matrix mock
     assert generated_output == [5, 5]
-    
+
     # Clean up the test suite environment by explicitly canceling the infinite loop task
     loop_task.cancel()
-    
+
     # Wrap the cancellation await in a try block to handle the expected task destruction exception gracefully
     try:
         # Await the canceled task to confirm it has terminated safely
