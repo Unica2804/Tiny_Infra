@@ -246,11 +246,11 @@ class TinyInfraTUI(App):
                 assistant_bubble.update_text("".join(accumulated_text) + "\n\n[dim italic][Stream Cancelled][/dim italic]")
                 raise
         except Exception as e:
-            if indicator in container.children:
+            if indicator in chat_container.children:
                 await indicator.remove()
 
             error_bubble = ChatBubble(role="error", content=f"Failed to generate response: {e}")
-            await container.mount(error_bubble)
+            await chat_container.mount(error_bubble)
             error_bubble.scroll_visible()
             self.messages.pop()
         finally:

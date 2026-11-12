@@ -6,7 +6,6 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "torch",
-    "torchvision",
     "accelerate",
     "safetensors",
     "numpy",
@@ -28,3 +27,6 @@ explicit = true  # Prevents non-PyTorch packages from searching this index
 [tool.uv.sources]
 torch = [{ index = "pytorch-cu128" }]
 torchvision = [{ index = "pytorch-cu128" }]
+
+[tool.uv]
+link-mode = "hardlink"
