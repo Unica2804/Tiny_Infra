@@ -82,7 +82,7 @@ class Qwen2Attention(nn.Module):
         rope_inplace(query_3d, key_3d, cos_cache, sin_cache, pos_id_flat)
 
         # Handover the cached key and value states to the KVCacheManager for updating and fetching
-        block_tables, context_lens = kv_cache.allocate_and_insert(
+        block_tables, context_length = kv_cache.allocate_and_insert(
             layer_idx=layer_idx,
             batch_indices=batch_indices,
             new_keys=key_states.transpose(1, 2),
@@ -90,18 +90,18 @@ class Qwen2Attention(nn.Module):
         )
         # Execution router to route between prefill and decode
         if q_length > 1:
-            # prefill mode, we will use pytorch sdpa
-            num_repeats = self.num_heads // self.num_kv_heads
-            k_contig = key_states.repeat_interleave(num_repeats, dim=2)
-            v_contig = value_states.repeat_interleave(num_repeats, dim=2)
+            # # prefill mode, we will use pytorch sdpa
+            # num_repeats = self.num_heads // self.num_kv_heads
+            # k_contig = key_states.repeat_interleave(num_repeats, dim=2)
+            # v_contig = value_states.repeat_interleave(num_repeats, dim=2)
 
             # SDPA expects shape: [batch_size, num_heads, seq_length, head_dim]
             q_sdpa = query_states.transpose(1, 2)
-            k_sdpa = k_contig.transpose(1, 2)
-            v_sdpa = v_contig.transpose(1, 2)
+            k_sdpa = key_states.transpose(1, 2)
+            v_sdpa = value_states.transpose(1, 2)
 
             # Execute using pytorch scaled dot product attention with causal masking
-            attn_output = F.scaled_dot_product_attention(q_sdpa, k_sdpa, v_sdpa, is_causal=True)
+            attn_output = F.scaled_dot_product_attention(q_sdpa, k_sdpa, v_sdpa, is_causal=True, enable_flash=True, enable_gqa=True)
             attn_output = attn_output.transpose(1, 2).contiguous()
         else:
             # decode mode, we will use custom paged attention kernel
@@ -113,7 +113,7 @@ class Qwen2Attention(nn.Module):
 
             # Slice the tracking tensors to match the query rows
             active_block_tables = block_tables[batch_indices]
-            active_context_lens = context_lens[batch_indices] + q_length
+            active_context_length = context_length[batch_indices] + q_length
 
             custom_paged_attn.launch_paged_attention(
                 attn_output,
@@ -121,7 +121,7 @@ class Qwen2Attention(nn.Module):
                 kv_cache.key_cache[layer_idx],
                 kv_cache.value_cache[layer_idx],
                 active_block_tables,
-                active_context_lens,
+                active_context_length,
                 kv_cache.block_size,
             )
 

@@ -6,6 +6,7 @@ Status as of Nov 2026. Based on the repo audit on the day this was written (see 
 
 Each phase has a goal, concrete tasks, and acceptance criteria. Phases land behind
 flags so the engine never regresses. Order is dependency-driven, not calendar-order.
+Legend: `[x]` done · `[~]` partially done (notes inline) · `[ ]` not done.
 
 **Standing rules**
 - Every phase that touches the math lands with a numerical-equivalence test
@@ -19,6 +20,15 @@ flags so the engine never regresses. Order is dependency-driven, not calendar-or
 ---
 
 ## Repo audit (the short version)
+
+State as of 2026-11-13 — update this block as phases land.
+
+Local `Dev` sits on `82ae0f6` (merge of the remote line back into local — remote had
+only the pre-revamp snapshot `be545fa`; tree unified). Verified working: package builds
+(`uv build`), installs, console scripts, native loading from untouched HF snapshots,
+RoPE kernel (wired+tested), paged-attention kernel (tested, autotuned, not wired).
+Not yet end-to-end: the 5 original test files are stale; decode path unwired; serve
+can't generate.
 
 What exists: Qwen2.5-0.5B FP16 inference (custom modules), paged KV cache, continuous
 batching, streaming SSE, FastAPI server, Textual TUI, Triton fused MLP.
@@ -35,13 +45,13 @@ safetensors produced by `utils/extractor.py`.
 ---
 
 ## Phase 0 — Snapshot the current state
-*(½ day)*
+*(½ day)* — **DONE** (be545fa "Pre Revamp"; `*.so` untracked + gitignored)
 
-- [ ] Commit or stash the uncommitted changes (`pyproject.toml`, `uv.lock`, `tui_client.py`).
-- [ ] Tag `pre-roadmap` so this state is always recoverable.
-- [ ] `git rm --cached engine/ops/*.so` and add `*.so` to `.gitignore`.
+- [x] Commit or stash the uncommitted changes (`pyproject.toml`, `uv.lock`, `tui_client.py`).
+- [ ] Tag `pre-roadmap` so this state is always recoverable.  *(not done — be545fa serves as snapshot)*
+- [x] `git rm --cached engine/ops/*.so` and add `*.so` to `.gitignore`.
 
-**Done when:** working tree is clean on a tagged commit.
+**Done when:** working tree is clean on a tagged commit. *(tree clean; tag never cut)*
 
 ## Phase 1 — Cleanup & installable package
 *(3–5 days)*
@@ -59,54 +69,61 @@ tests/       (fixed suite + parity harness)
 scripts/
 ```
 
-- [ ] `pyproject.toml` becomes the only dep file; `uv.lock` regenerated; delete `requirements.txt`.
-- [ ] Console entry points: `tinyinfra-serve`, `tinyinfra-tui`; `uv run` works.
+- [x] `pyproject.toml` becomes the only dep file; `uv.lock` regenerated; delete `requirements.txt`.
+- [x] Console entry points: `tinyinfra-serve`, `tinyinfra-tui`; `uv run` works.  *(serve boots to lifespan; generation itself still blocked by P2 wiring)*
 
 **Native-checkpoint loading (plug-and-play).** The HF key naming is used by the
 modules as-is — the translation lived entirely in the weight file, so native loading
 is loader work, not model work:
-- [ ] `load_model(model_ref, ...)`: `model_ref` = HF hub id or local snapshot dir;
-      merge-load all `.safetensors` shards with `strict=True`; clear error on
-      missing/unexpected keys (lists them).
-- [ ] `QwenConfig` built from the checkpoint's `config.json` (vocab_size, hidden_size,
+- [x] `load_model(model_ref, ...)`: `model_ref` = HF hub id or local snapshot dir;
+      shard-union `.safetensors` load, clear error on missing/unexpected keys (lists them).  *(note: union-load, not `strict=True` in one pass — each shard validated before load; stricter, holds less RAM)*
+- [x] `QwenConfig` built from the checkpoint's `config.json` (vocab_size, hidden_size,
       num_layers, heads, kv-heads, intermediate_size, rope_theta, rms_norm_eps,
       tie_word_embeddings, max_position_embeddings) — no hardcoded 0.5B values;
       unknown `model_type` → explicit error listing supported archs.
-- [ ] `tie_word_embeddings`: alias `lm_head.weight` → `model.embed_tokens.weight`
+- [x] `tie_word_embeddings`: alias `lm_head.weight` → `model.embed_tokens.weight`
       when the checkpoint omits it (Qwen2.5-0.5B ties).
 - [ ] KV `max_seq_len` is a **serving-window flag** (default 1024/4096), never
-      `max_position_embeddings` (Qwen2.5 reports 131,072 — don't allocate for it).
-- [ ] EOS from `generation_config.json` (`eos_token_id` may be a list; chat models
-      commonly stop on `<|im_end|>` ≠ tokenizer default).
-- [ ] Delete `utils/extractor.py`, the custom naming, and the 2.5 GB extracted file;
-      `weights/` is optional download cache only. No backwards-compat shim.
-- [ ] `--model` flag on serve; tokenizer strictly from the same hub id/dir.
-- [ ] Bugfix pass (from audit): `main.py` gather both tasks; `top_p`→`p_value` in TUI;
-      SSE disconnect → `stream_gen.aclose()` in `finally`; per-request error isolation in decode;
-      `finish_reason` from real stop reason; throughput counters count tokens not sequences;
-      drop CUDA sync in `_report_throughput`; delete dead/commented code; logger not `print`.
-- [ ] Kill or fix broken tests; add `pytest`/`pytest-asyncio` to dev deps; `[tool.pytest.ini_options]`.
+      `max_position_embeddings` (Qwen2.5 reports 131,072 — don't allocate for it).  *(server still hardcodes 1024)*
+- [~] EOS from `generation_config.json` — `load_eos_token_ids()` exists and server uses the first id;
+      full list plumbed into scheduler pending (scheduler still takes a single int).
+- [x] Delete `utils/extractor.py`, the custom naming, and the 2.5 GB extracted file;
+      `weights/` is optional download cache only. No backwards-compat shim.  *(code-side done; `weights/` file still on disk)*
+- [~] `--model` flag on serve — done via `TINYINFRA_MODEL` env var (default Qwen/Qwen2.5-0.5B-Instruct);
+      no CLI flag yet.
+- [ ] Bugfix pass (from audit): `main.py` removed ✔; `top_p`→`p_value` in TUI ✘ (still sends `top_p`);
+      SSE disconnect → `stream_gen.aclose()` in `finally` ✘; per-request error isolation in decode ✘;
+      `finish_reason` from real stop reason ✘ (still hardcoded `"stop"`); throughput counters count tokens not sequences ✘;
+      drop CUDA sync in `_report_throughput` ✘; dead/commented code cleanup ✘; logger-not-`print` ✘.
+- [x] Kill or fix broken tests; add `pytest`/`pytest-asyncio` to dev deps; `[tool.pytest.ini_options]`.
+      *(rope_test.py 6/6, paged_attn_test.py 13/13 green; the 5 old test files still stale)*
 - [ ] CI (GitHub Actions): ruff lint + pytest (CUDA-marked tests skip on CPU runners).
 - [ ] README: honest quickstart (install, `tinyinfra-serve --model Qwen/Qwen2.5-0.5B-Instruct`, chat).
 
 **Done when:** fresh clone → `uv sync` → `uv run pytest` green → `tinyinfra-serve --model <hf-id>` boots
 from the untouched hub snapshot (no extraction step) → `tinyinfra-tui` holds a multi-turn conversation.
+*(not met: 4 stale test files; decode path unwired; serve can't generate yet)*
 
 ## Phase 2 — Triton kernel port
 *(4–7 days)*
 
 Delete the CUDA path entirely; nothing to compile, nothing to pin.
 
-- [ ] RoPE → Triton (in-place, cos/sin tables, GQA over kv-heads).
-- [ ] Paged decode attention → Triton (flash-style online softmax; block-table
+- [x] RoPE → Triton (in-place, cos/sin tables, GQA over kv-heads).  `kernels/Rope.py`;
+      wired into `qwen_2.py`; 6 tests green.
+- [~] Paged decode attention → Triton (flash-style online softmax; block-table
       indirection; GQA `kv_head = head // (heads/kv_heads)`; fp16 in, fp32 accum).
+      `kernels/Paged_Attn.py` done + 13 tests green + @triton.autotune; **not yet wired
+      into `qwen_2.py`** (still points at deleted CUDA ext).
       Prefill keeps PyTorch SDPA (it's flash-backed) unless Triton prefill wins benchmarks.
 - [ ] RMSNorm → Triton (fuse residual add; fp32 variance).
 - [ ] Delete `csrc/`, `setup.py`, `engine/ops/`; remove `custom_swiglu` (unused;
-      fused-MLP Triton kernel already subsumes it).
-- [ ] Parity harness: random-tensor tests, engine-vs-SDPA, engine-vs-HF logits on a fixed
-      prompt (greedy token agreement). Run in CI.
-- [ ] Microbenchmarks per kernel vs old CUDA path.
+      fused-MLP Triton kernel already subsumes it).  *(`csrc/` CUDA sources still present+tracked)*
+- [~] Parity harness: random-tensor tests, engine-vs-SDPA, engine-vs-HF logits on a fixed
+      prompt (greedy token agreement).  *(kernel-level tests done for Rope + PagedAttn;
+      engine-vs-HF end-to-end never built; no CI)*
+- [~] Microbenchmarks per kernel vs old CUDA path.  *(`scripts/bench_paged_attn.py`;
+      no rope/fused-mlp numbers, no old-vs-new comparison)*
 
 **Done when:** no `.so` anywhere, engine produces identical greedy output vs HF
 reference on the parity prompt, tok/s no worse than the old kernels.
@@ -118,7 +135,8 @@ Maximum fusion, measurable, flag-guarded:
 
 - [ ] Add + RMSNorm fused Triton kernel (kill two elementwise passes).
 - [ ] Attention-out + residual + post-attention-norm fused.
-- [ ] Gate/up GEMM + SwiGLU (exists) and down-proj + residual (verify, then keep).
+- [~] Gate/up GEMM + SwiGLU (exists — `kernels/fused_mlp.py`, Triton; never validated end-to-end) and down-proj + residual
+      (same file — never validated against a reference).
 - [ ] Optionally `torch.compile` on the remaining glue (norms, residuals) behind a flag.
 - [ ] LM head GEMM left unfused (beneficial to fuse only with sampling argmax — later).
 - [ ] Benchmark table (prefill ms, decode tok/s, VRAM) per fusion flag.
@@ -232,6 +250,21 @@ reference, and it serves through the normal API/TUI.
 - [ ] CI smoke test: generate 32 tokens on CPU (numerical checks only).
 
 ---
+
+## Later (deliberately deferred)
+
+- **Flash-decoding (split-KV) for decode attention.** The current Triton paged
+  decode kernel (`kernels/Paged_Attn.py`) is single-pass online softmax: one CTA
+  per (q_head, batch), serially walking KV blocks. At 0.5B scale this is fine —
+  ~65 µs/layer at bsz=4/ctx=1024 (~8 GB/s effective vs ~192 GB/s peak), and GEMMs
+  dominate decode wall time — but it leaves SMs idle at long context.
+  Plan when revisited: split KV blocks across CTAs (partial `(m, d, acc)` per
+  split) + a small combine kernel; flag-gated (e.g. `TINYINFRA_FLASH_DECODE=1`);
+  revisit when ctx ≥ 4k or batch×heads underutilizes SMs. Measured on RTX 2050:
+  block_size 64 ≈ 33% faster than 16 (43 µs vs 65 µs); split-KV estimated 2–4× at
+  ctx ≥ 1024. Also revisit cache `BLOCK_SIZE` (16 → 64) at the same time —
+  fewer serial iterations, not just faster kernel. Gate: greedy-token parity vs
+  the single-pass kernel; block-table and GQA paths unchanged.
 
 ## Dependencies & order
 
