@@ -2,13 +2,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-try:  # CUDA extensions were deleted in Phase 0; kernels return as Triton in Phase 2.
-    import tinyinfra.engine.ops.custom_paged_attn as custom_paged_attn
-except ModuleNotFoundError:
-    custom_paged_attn = None
-    custom_rope = None
 from tinyinfra.engine.cache_manager import KVCacheManager
 from tinyinfra.kernels.fused_mlp import fused_mlp_forward
+from tinyinfra.kernels.Paged_Attn import launch_paged_attention
 from tinyinfra.kernels.Rope import rope_inplace
 from tinyinfra.models.config import QwenConfig
 
@@ -101,32 +97,26 @@ class Qwen2Attention(nn.Module):
             v_sdpa = value_states.transpose(1, 2)
 
             # Execute using pytorch scaled dot product attention with causal masking
-            attn_output = F.scaled_dot_product_attention(q_sdpa, k_sdpa, v_sdpa, is_causal=True, enable_flash=True, enable_gqa=True)
+            attn_output = F.scaled_dot_product_attention(
+                q_sdpa, k_sdpa, v_sdpa, is_causal=True, enable_gqa=True
+            )
             attn_output = attn_output.transpose(1, 2).contiguous()
         else:
             # decode mode, we will use custom paged attention kernel
-            # it expects a 3D Query tensor: [batch_size, num_heads, head_dim]
+            # expects a 3D Query tensor: [batch_size, num_heads, head_dim]
             query_states = query_states.squeeze(1)
-
-            # launch paged attention and allocate a output tensor
-            attn_output = torch.empty_like(query_states)
 
             # Slice the tracking tensors to match the query rows
             active_block_tables = block_tables[batch_indices]
             active_context_length = context_length[batch_indices] + q_length
 
-            custom_paged_attn.launch_paged_attention(
-                attn_output,
+            attn_output = launch_paged_attention(
                 query_states,
                 kv_cache.key_cache[layer_idx],
                 kv_cache.value_cache[layer_idx],
                 active_block_tables,
                 active_context_length,
-                kv_cache.block_size,
-            )
-
-            # reshape and project back to hidden size
-            attn_output = attn_output.unsqueeze(1)
+            ).unsqueeze(1)
         attn_output = attn_output.view(batch_size, q_length, self.hidden_size)
         return self.o_proj(attn_output)
 

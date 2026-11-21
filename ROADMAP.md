@@ -27,8 +27,11 @@ Local `Dev` sits on `82ae0f6` (merge of the remote line back into local — remo
 only the pre-revamp snapshot `be545fa`; tree unified). Verified working: package builds
 (`uv build`), installs, console scripts, native loading from untouched HF snapshots,
 RoPE kernel (wired+tested), paged-attention kernel (tested, autotuned, not wired).
-Not yet end-to-end: the 5 original test files are stale; decode path unwired; serve
-can't generate.
+Not yet end-to-end: the 5 original test files are stale. REAL model verified 2026-11-21:
+`weights/qwen` (Qwen2.5-0.5B **base**) loads natively, matches HF transformers
+token-for-token on raw prompts, and serves through FastAPI (15 tok/s decode);
+chat prompts need the Instruct checkpoint (base + Instruct chat template gives
+nonsense in HF too).
 
 What exists: Qwen2.5-0.5B FP16 inference (custom modules), paged KV cache, continuous
 batching, streaming SSE, FastAPI server, Textual TUI, Triton fused MLP.
@@ -111,17 +114,18 @@ Delete the CUDA path entirely; nothing to compile, nothing to pin.
 
 - [x] RoPE → Triton (in-place, cos/sin tables, GQA over kv-heads).  `kernels/Rope.py`;
       wired into `qwen_2.py`; 6 tests green.
-- [~] Paged decode attention → Triton (flash-style online softmax; block-table
-      indirection; GQA `kv_head = head // (heads/kv_heads)`; fp16 in, fp32 accum).
-      `kernels/Paged_Attn.py` done + 13 tests green + @triton.autotune; **not yet wired
-      into `qwen_2.py`** (still points at deleted CUDA ext).
-      Prefill keeps PyTorch SDPA (it's flash-backed) unless Triton prefill wins benchmarks.
+- [x] Paged decode attention → Triton (flash-style online softmax; block-table
+      indirection; GQA; fp16 in, fp32 accum). `kernels/Paged_Attn.py`; 13 tests green;
+      `@triton.autotune` (9 configs); wired into `qwen_2.py` 2026-11-19; verified via
+      `tests/parity_test.py` (tiny synthetic Qwen2 vs HF transformers — prefill + one
+      KV-cache decode step, fp16, greedy tokens identical).
+      Prefill keeps PyTorch SDPA (flash-backed) with `enable_gqa=True` (no repeat_interleave).
 - [ ] RMSNorm → Triton (fuse residual add; fp32 variance).
 - [ ] Delete `csrc/`, `setup.py`, `engine/ops/`; remove `custom_swiglu` (unused;
       fused-MLP Triton kernel already subsumes it).  *(`csrc/` CUDA sources still present+tracked)*
-- [~] Parity harness: random-tensor tests, engine-vs-SDPA, engine-vs-HF logits on a fixed
-      prompt (greedy token agreement).  *(kernel-level tests done for Rope + PagedAttn;
-      engine-vs-HF end-to-end never built; no CI)*
+- [x] Parity harness: tiny random Qwen2 checkpoint (no downloads), same safetensors into
+      HF transformers + tinyinfra; prefill logits + one decode step, fp16, greedy tokens
+      identical.  *(vs 0.5B and vs HF with real weights not yet run; no CI)*
 - [~] Microbenchmarks per kernel vs old CUDA path.  *(`scripts/bench_paged_attn.py`;
       no rope/fused-mlp numbers, no old-vs-new comparison)*
 
@@ -143,6 +147,36 @@ Maximum fusion, measurable, flag-guarded:
 
 **Done when:** each fusion individually togglable, parity tests pass with it on,
 README/benchmark table shows the wins.
+
+## Phase 3½ — CUDA graphs (decode only)
+*(after Phase 3+4 prerequisites; 3–5 days)*
+
+Profiler-verified rationale (2026-11-21): warm decode = 11.2 ms GPU + ~10 ms CPU gap
+at ~20 ms wall; GPU kernels are 89–97% DRAM-bound (graphs cannot speed those up).
+Graphs target the ~70+ kernel launches/step and CPU dispatch, NOT the memory wall.
+
+**Prerequisites — none of these can be captured, so land them first:**
+- [ ] Startup kernel warmup (JIT + autotune before capture) — removes cold 624 ms TTFT.
+- [ ] Vectorize `KVCacheManager.allocate_and_insert` — remove `.item()` syncs and
+      Python block allocation (~6.7 ms/step); blocks allocated from a GPU free list,
+      no host reads inside the replayed region.
+- [ ] W4A16/W8A16 GEMMs (Phase 4) — halves/quarters the DRAM bytes that dominate.
+- [ ] Fused RMSNorm/residual (Phase 3) — kills ~150 tiny elementwise launches/step.
+
+**Capture design:**
+- [ ] Decode-only graphs; prefill (variable length, SDPA) stays eager.
+- [ ] Static input buffers + per-batch-size capture buckets (continuous batching
+      changes slot count); copy dynamic input_ids, block_tables, context_length,
+      positions into static tensors before `graph.replay()`.
+- [ ] EOS/sampling decisions stay outside the captured region (host needs tokens).
+- [ ] Flag-gated (`TINYINFRA_CUDA_GRAPHS=1`), parity test against graph-off path.
+
+**Reality check:** expected gain ~15–25% wall-clock on top of the prerequisites,
+not 2×. Explicitly **incompatible with Phase 5 streaming weights** (H2D copies +
+changing residency break static capture) — graphs disabled when streaming is on.
+
+**Done when:** graphed decode path matches graph-off greedy tokens, and the benchmark
+table shows the launch-overhead delta at batch 1/4/8.
 
 ## Phase 4 — Quantization (load external checkpoints only)
 *(2–4 weeks, staged)*
