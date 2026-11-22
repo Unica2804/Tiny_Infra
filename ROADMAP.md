@@ -156,7 +156,9 @@ at ~20 ms wall; GPU kernels are 89–97% DRAM-bound (graphs cannot speed those u
 Graphs target the ~70+ kernel launches/step and CPU dispatch, NOT the memory wall.
 
 **Prerequisites — none of these can be captured, so land them first:**
-- [ ] Startup kernel warmup (JIT + autotune before capture) — removes cold 624 ms TTFT.
+- [x] Startup kernel warmup (JIT + autotune before capture) — removes cold 624 ms TTFT.
+      `engine/warmup.py` + scheduler-path dummy request in lifespan (`TINYINFRA_WARMUP=0` to skip).
+      Verified: warmup request absorbs ~138 ms first-use; first real request TTFT 48.6 ms.
 - [ ] Vectorize `KVCacheManager.allocate_and_insert` — remove `.item()` syncs and
       Python block allocation (~6.7 ms/step); blocks allocated from a GPU free list,
       no host reads inside the replayed region.
@@ -303,13 +305,15 @@ reference, and it serves through the normal API/TUI.
 ## Dependencies & order
 
 ```
-P0 → P1 → P2 → P3 ─────────────────────┐
-          └→ P4A → P4B ─→ P5 (streaming) → P6 → P7
-                     └→ P4C (W8A8) → P8 (harness, ongoing)
+P0 → P1 → P2 → P3 → (warmup + cache-vectorize) → P4A/4B ─┬→ P3½ CUDA graphs → P6 → P7
+                                                        └→ P5 (streaming; graphs OFF) → P6
+                                          P4C (W8A8) → P8 (harness, ongoing)
 ```
 
 Phase 5 depends on Phase 4 Stage B being correct (streaming FP16 is not viable).
 Phase 6 is independent of 4–5 and can overlap. P7 needs P2's Triton infrastructure.
+P3½ depends on warmup + cache vectorization + Phase 4 GEMMs + Phase 3 fusion — it
+sits after quant, before streaming; incompatible with streaming (mutually exclusive flags).
 
 ## Explicitly out of scope (for now)
 
@@ -328,6 +332,7 @@ serving, LoRA/adapters, embeddings endpoint, in-engine quantization (calibrate).
 | Streaming slower than hoped (PCIe 3.0 x16 ≈ 16 GB/s) | W4 streaming (≈4.5 GB) as headline; benchmark prefetch depth; page-cache warm reads; document floor formula `bytes/PCIe_bw` |
 | VRAM pressure (weights + KV cache) | boot-time budget check; KV cache after weights; streaming buffers bounded at 2 layers |
 | P7 scope creep | text-only, flag-gated; P7 only after P6 ships |
+| CUDA graphs capture fails on dynamic shapes | static buffers + batch buckets; flag-gated; disable whenever streaming is active |
 | Dependency drift again | `pyproject.toml` is the single source; CI reinstalls from scratch |
 
 ## Rough effort

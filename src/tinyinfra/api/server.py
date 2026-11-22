@@ -1,8 +1,8 @@
 import asyncio
 import logging
-from contextlib import asynccontextmanager
-
 import os
+import time
+from contextlib import asynccontextmanager
 
 import torch
 from fastapi import FastAPI
@@ -12,6 +12,7 @@ from tinyinfra.api.router import router
 from tinyinfra.engine.cache_manager import KVCacheManager
 from tinyinfra.engine.loader import load_eos_token_ids, load_model
 from tinyinfra.engine.scheduler import ContinuousBatcher
+from tinyinfra.engine.warmup import warmup_engine
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [%(name)s] %(message)s")
 logger = logging.getLogger("tinyinfra.server")
@@ -52,6 +53,18 @@ async def lifespan(app: FastAPI):
     app.state.background_loop_task = background_task
     app.state.model = model
     app.state.model_name = model_name
+    if device == "cuda" and os.environ.get("TINYINFRA_WARMUP", "1") != "0":
+        warm_start = time.perf_counter()
+        warmup_engine(model, config, kv_cache, scheduler.cos_cache, scheduler.sin_cache,
+                      device=device)
+        # Warm the full serving path too: queue -> prefill/decode -> sampling ->
+        # finish/slot-free. Without this, the first real request pays ~80 ms of
+        # scheduler first-use latency even though the kernels are already JIT'd.
+        await scheduler.generate(prompt_tokens=[1, 2, 3, 4, 5] * 6, max_new_tokens=2)
+        torch.cuda.synchronize()
+        logger.info("Warmup complete in %.2fs", time.perf_counter() - warm_start)
+    else:
+        logger.info("Warmup skipped (CPU device or TINYINFRA_WARMUP=0)")
 
     logger.info("Inference Server initialized successfully.")
     yield
