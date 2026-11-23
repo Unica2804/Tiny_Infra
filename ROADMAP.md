@@ -159,9 +159,13 @@ Graphs target the ~70+ kernel launches/step and CPU dispatch, NOT the memory wal
 - [x] Startup kernel warmup (JIT + autotune before capture) — removes cold 624 ms TTFT.
       `engine/warmup.py` + scheduler-path dummy request in lifespan (`TINYINFRA_WARMUP=0` to skip).
       Verified: warmup request absorbs ~138 ms first-use; first real request TTFT 48.6 ms.
-- [ ] Vectorize `KVCacheManager.allocate_and_insert` — remove `.item()` syncs and
+- [x] Vectorize `KVCacheManager.allocate_and_insert` — remove `.item()` syncs and
       Python block allocation (~6.7 ms/step); blocks allocated from a GPU free list,
       no host reads inside the replayed region.
+      **Done 2026-11-23 as dual-path** (decode keeps cheap loop; prefill vectorized):
+      TTFT 48.6→25.5 ms, decode 49→49.6 tok/s. Note: remaining `.item()` in decode
+      means full CUDA-graph capture still needs a truly sync-free decode path — revisit
+      if graph capture fails on host reads.
 - [ ] W4A16/W8A16 GEMMs (Phase 4) — halves/quarters the DRAM bytes that dominate.
 - [ ] Fused RMSNorm/residual (Phase 3) — kills ~150 tiny elementwise launches/step.
 
