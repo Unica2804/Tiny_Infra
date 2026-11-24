@@ -194,11 +194,18 @@ Weights stay packed/int8 on GPU; dequant happens in-kernel; activations stay FP1
 (except W8A8). GPTQ support falls out of the AWQ loader (same `qweight/qzeros/scales`
 family).
 
-Stage A — **W8A16** (per-output-channel int8 weights, fp16 activations)
-- [ ] Triton dequant+GEMM (int8 load → scale → fp16 dot); int8 weights resident.
-- [ ] Loader/config: `quant_method: int8`, static per-channel scales from checkpoint.
+Stage A — **W8A16** (per-group int8 weights, fp16 activations)
+- [x] Triton dequant+GEMM (`kernels/quants/w8a16.py`; audited + autotuned 2026-11-24;
+      decode 74→62 µs, prefill 222→157 µs). Supports GPTQ-Int8 / AWQ-8bit / llm-compressor
+      W8A16 checkpoints — GPTQ `bits=8` is a first-class configuration (HF docs), and
+      Qwen2.5-0.5B-Instruct-GPTQ-Int8 is a real reference checkpoint (`bits:8, group_size:128, sym:true`).
+- [x] Loader/config: GPTQ-Int8 hooks landed 2026-11-24 — `engine/quant/` registry + gptq adapter,
+      `QuantLinear` bridge, loader module replacement, Qwen2MLP quantized path. Verified with
+      `tests/quant_parity_test.py` (independent dequant reference) and real Qwen2.5-0.5B-GPTQ-Int8
+      checkpoint ("The capital of France is Paris.", ~39 tok/s decode). AWQ-8bit adapter is a
+      one-line registration once a reference checkpoint is chosen.
 
-Stage B — **W4A16 AWQ** (group-128, symmetric or asymmetric)
+Stage B — **W4A16** (group-128, symmetric or asymmetric) — separate kernel, later sibling of W8A16
 - [ ] Triton AWQ-GEMM: unpack int4 from packed int32 (`qweight [K, N/8]`), apply
       `scales`/`qzeros` (sym → no zero-point math), fp16 dot.
 - [ ] Validate on a Qwen2.5-0.5B AWQ checkpoint (pull from Hub; **not** the on-disk

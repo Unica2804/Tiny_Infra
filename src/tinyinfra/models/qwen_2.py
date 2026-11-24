@@ -130,8 +130,14 @@ class Qwen2MLP(nn.Module):
         self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
 
     def forward(self, x: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
-        # Flatten batch/seq dims for the fused 2D kernels
-        original_shape = x.shape
+        from tinyinfra.engine.quant.linear import QuantLinear
+        if isinstance(self.gate_proj, QuantLinear):
+            # Quantized path: each projection dispatches to its Triton dequant GEMM.
+            h = x.view(-1, x.shape[-1])
+            g = torch.nn.functional.silu(self.gate_proj(h)) * self.up_proj(h)
+            out = self.down_proj(g) + residual.view(-1, residual.shape[-1])
+            return out.view(*x.shape[:-1], self.down_proj.out_features)
+        # fp16 fused path: gate/up GEMM + SwiGLU + down GEMM + residual
         x_2d = x.view(-1, x.shape[-1])
         residual_2d = residual.view(-1, residual.shape[-1])
 
@@ -143,7 +149,7 @@ class Qwen2MLP(nn.Module):
             self.down_proj.weight,
             residual_2d,
         )
-        return out_2d.view(*original_shape[:-1], self.down_proj.out_features)
+        return out_2d.view(*x.shape[:-1], self.down_proj.out_features)
 
 
 class Qwen2DecodeLayer(nn.Module):

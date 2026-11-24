@@ -14,6 +14,8 @@ from pathlib import Path
 import torch
 from safetensors.torch import load_file
 
+from tinyinfra.engine.quant import get_adapter
+from tinyinfra.engine.quant.linear import QuantLinear
 from tinyinfra.models import (
     get_config_class,
     get_model_class,
@@ -77,6 +79,13 @@ def load_model(
 
     model = model_cls(config)
     expected = set(model.state_dict().keys())
+    quant_cfg = cfg.get("quantization_config")
+    quant_tensors: dict[str, dict] = {}       # module path -> {qweight,qzeros,scales,g_idx,bias?}
+    if quant_cfg:
+        method, bits = quant_cfg["quant_method"], int(quant_cfg.get("bits", 4))
+        group = int(quant_cfg.get("group_size", 128))
+        sym = bool(quant_cfg.get("sym", True))
+        skip = set(quant_cfg.get("modules_to_not_convert") or [])
 
     shards = sorted(model_dir.glob("*.safetensors"))
     if not shards:
@@ -86,12 +95,46 @@ def load_model(
     for shard in shards:
         logger.info("Loading %s", shard.name)
         state = load_file(str(shard))
+        if quant_cfg:
+            for key in list(state):
+                if ".qweight" in key or ".qzeros" in key or ".scales" in key or ".g_idx" in key:
+                    mod, field = key.rsplit(".", 1)
+                    quant_tensors.setdefault(mod, {})[field] = state.pop(key)
         _, unexp = model.load_state_dict(state, strict=False)
         loaded |= set(state.keys())
         unexpected |= set(unexp)
         del state
 
+    if quant_cfg:
+        adapter = get_adapter(method, bits)
+        logger.info("Quantized checkpoint: %s bits=%d group=%d -> %d layers",
+                    method, bits, group, len(quant_tensors))
+        for mod_path, tensors in quant_tensors.items():
+            if "qweight" not in tensors:
+                continue
+            parent_path, _, name = mod_path.rpartition(".")
+            parent = model.get_submodule(parent_path)
+            linear = model.get_submodule(mod_path)
+            bias = getattr(linear, "bias", None)
+            # g_idx maps each K row to a quant group. Kernel assumes sequential
+            # grouping (g_idx[i] == i // group), which is what desc_act=false produces.
+            gi = tensors.get("g_idx")
+            if gi is not None and not torch.equal(gi.long(), torch.arange(len(gi), device=gi.device) // group):
+                raise NotImplementedError(f"act-order (non-sequential g_idx) at {mod_path} not supported")
+            qt = adapter(tensors["qweight"], tensors["qzeros"], tensors["scales"],
+                         group, sym, bias=bias)
+            setattr(parent, name, QuantLinear(qt))
+        for mod_path in quant_tensors:
+            unexpected.discard(mod_path + ".qweight")
+            unexpected.discard(mod_path + ".qzeros")
+            unexpected.discard(mod_path + ".scales")
+            unexpected.discard(mod_path + ".g_idx")
+
     missing = expected - loaded
+    if quant_cfg:
+        # replaced nn.Linear.weight keys no longer exist on the model
+        for mod_path in quant_tensors:
+            missing.discard(mod_path + ".weight")
     # Tied checkpoints omit lm_head.weight — alias it to the embedding matrix.
     if config.tie_word_embeddings:
         missing.discard("lm_head.weight")
