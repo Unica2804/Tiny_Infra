@@ -32,8 +32,7 @@ class KVCacheManager:
         self.block_tables = torch.full(
             (max_batch_size, self.max_blocks_per_seq), -1, dtype=torch.int32, device=device
         )
-        # free pool: Python list for the cheap decode path; int32 tensor mirror for prefill
-        # Single source of truth: device tensor + host-known count. No Python list.
+        
         self.free_blocks_t = torch.arange(self.total_physical_blocks, device=device, dtype=torch.int32)
         self.free_count = self.total_physical_blocks
 
@@ -89,7 +88,7 @@ class KVCacheManager:
             new_values = new_values.unsqueeze(2)
         incoming_seq_len = new_keys.size(2)
 
-        # DECODE (T=1): original cheap loop — 0.12 ms/call; vectorizing it regressed throughput.
+        # DECODE (T=1)
         if incoming_seq_len == 1:
             for i, batch_idx in enumerate(batch_indices.tolist()):
                 start_pos = self.seq_len[batch_idx].item()

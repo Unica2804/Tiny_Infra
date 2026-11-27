@@ -46,4 +46,4 @@ class QuantTensor:
 
 
 # Import adapters so they register themselves. Keep at bottom to avoid cycles.
-from tinyinfra.engine.quant import gptq  # noqa: E402,F401
+from tinyinfra.engine.quant import gptq, compressed_tensors  # noqa: E402,F401

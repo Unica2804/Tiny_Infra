@@ -2,6 +2,7 @@ import torch
 import triton
 import triton.language as tl
 
+
 @triton.autotune(
     configs=[
         # Best read from the 2026-11-24 sweep: decode (M<=4) + prefill (M>=128)
@@ -52,7 +53,7 @@ def w8a16_kernel(
     acc = tl.zeros((BM, BN), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BK)):
         k_offset = k * BK
-        k_idx = k_offset + offs_k                       # absolute K positions in this tile
+        k_idx = k_offset + offs_k                       
         mask_x = (offs_m[:, None] < M) & (k_idx[None, :] < K)
         mask_w = (k_idx[:, None] < K) & (offs_n[None, :] < N)
 
@@ -91,13 +92,13 @@ def w8a16_matmul(
     assert (group_sz % 64 == 0 or 64 % group_sz == 0), "group_sz must align with 64"
     y = torch.empty((M, N), device=X.device, dtype=torch.float16)
 
-    # Grid depends on autotuned BM/BN — use the meta-aware lambda form.
+    
     grid = lambda META: (triton.cdiv(M, META['BM']), triton.cdiv(N, META['BN']))
 
     w8a16_kernel[grid](
         X, W, scales, zeros, y,
         M, N, K,
-        (0 if M <= 64 else 1),   # MB bucket, avoids per-prompt-length retuning
+        (0 if M <= 16 else 1),   # MB bucket, avoids per-prompt-length retuning
         X.stride(0), X.stride(1),
         W.stride(0), W.stride(1),
         scales.stride(0), scales.stride(1),

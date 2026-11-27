@@ -82,9 +82,23 @@ def load_model(
     quant_cfg = cfg.get("quantization_config")
     quant_tensors: dict[str, dict] = {}       # module path -> {qweight,qzeros,scales,g_idx,bias?}
     if quant_cfg:
-        method, bits = quant_cfg["quant_method"], int(quant_cfg.get("bits", 4))
-        group = int(quant_cfg.get("group_size", 128))
+        method = quant_cfg["quant_method"]
         sym = bool(quant_cfg.get("sym", True))
+        group = quant_cfg.get("group_size")
+        bits = quant_cfg.get("bits")
+        if group is None or bits is None:  # compressed-tensors: config_groups
+            cg = quant_cfg.get("config_groups")
+            if cg:
+                w = next(iter(cg.values())).get("weights", {})
+                if bits is None:
+                    bits = w.get("num_bits", w.get("bits", 4))
+                if group is None:
+                    group = w.get("group_size")
+                sym = bool(w.get("symmetric", sym))
+        bits = int(bits)
+        if group is None or group == -1:
+            group = config.hidden_size  # per-channel: one scale per output column
+        group = int(group)
         skip = set(quant_cfg.get("modules_to_not_convert") or [])
 
     shards = sorted(model_dir.glob("*.safetensors"))
@@ -97,7 +111,9 @@ def load_model(
         state = load_file(str(shard))
         if quant_cfg:
             for key in list(state):
-                if ".qweight" in key or ".qzeros" in key or ".scales" in key or ".g_idx" in key:
+                if (".qweight" in key or ".qzeros" in key or ".scales" in key
+                        or ".g_idx" in key or ".weight_packed" in key
+                        or ".weight_scale" in key or ".weight_shape" in key):
                     mod, field = key.rsplit(".", 1)
                     quant_tensors.setdefault(mod, {})[field] = state.pop(key)
         _, unexp = model.load_state_dict(state, strict=False)
@@ -110,7 +126,7 @@ def load_model(
         logger.info("Quantized checkpoint: %s bits=%d group=%d -> %d layers",
                     method, bits, group, len(quant_tensors))
         for mod_path, tensors in quant_tensors.items():
-            if "qweight" not in tensors:
+            if "qweight" not in tensors and "weight_packed" not in tensors:
                 continue
             parent_path, _, name = mod_path.rpartition(".")
             parent = model.get_submodule(parent_path)
@@ -121,14 +137,21 @@ def load_model(
             gi = tensors.get("g_idx")
             if gi is not None and not torch.equal(gi.long(), torch.arange(len(gi), device=gi.device) // group):
                 raise NotImplementedError(f"act-order (non-sequential g_idx) at {mod_path} not supported")
-            qt = adapter(tensors["qweight"], tensors["qzeros"], tensors["scales"],
-                         group, sym, bias=bias)
+            if "qweight" in tensors:
+                qt = adapter(tensors["qweight"], tensors["qzeros"], tensors["scales"],
+                             group, sym, bias=bias)
+            else:  # compressed-tensors: weight_packed/weight_scale/weight_shape
+                qt = adapter(tensors["weight_packed"], tensors["weight_scale"],
+                             tensors.get("weight_shape"), bias=bias)
             setattr(parent, name, QuantLinear(qt))
         for mod_path in quant_tensors:
             unexpected.discard(mod_path + ".qweight")
             unexpected.discard(mod_path + ".qzeros")
             unexpected.discard(mod_path + ".scales")
             unexpected.discard(mod_path + ".g_idx")
+            unexpected.discard(mod_path + ".weight_packed")
+            unexpected.discard(mod_path + ".weight_scale")
+            unexpected.discard(mod_path + ".weight_shape")
 
     missing = expected - loaded
     if quant_cfg:
