@@ -23,7 +23,7 @@ import triton.language as tl
 def w8a8_kernel(
     x_ptrs, w_ptrs, xscales_ptrs, wscales_ptrs, y_ptrs,
     M, N, K,
-    MB: tl.constexpr,          # 0 = small M (decode), 1 = large M (prefill)
+    MB: tl.constexpr,          
     stride_xm, stride_xk,
     stride_wk, stride_wn,
     stride_xs,
@@ -60,19 +60,19 @@ def w8a8_kernel(
         x_i8 = tl.load(x_ptrs, mask=mask_x, other=0)         # int8 activations
         w_i8 = tl.load(w_ptrs, mask=mask_w, other=0)         # int8 weights
 
-        # One quant group per K tile (group_sz % BK == 0 enforced by wrapper).
+        
         group_idx = k_offset // group_sz
         ws_ptrs = wscales_ptrs + (group_idx * stride_ws_group + offs_n[None, :] * stride_ws_n)
         w_scale = tl.load(ws_ptrs, mask=offs_n[None, :] < N, other=0.0).to(tl.float32)
 
-        # int8 x int8 -> int32 tensor-core dot; dequantize the partial with the weight scale.
+        
         partial = tl.dot(x_i8, w_i8, out_dtype=tl.int32)      # [BM, BN] int32
         acc += partial.to(tl.float32) * w_scale
 
         x_ptrs += BK * stride_xk
         w_ptrs += BK * stride_wk
 
-    # Activation scale is per-token (row); weight scale already applied per group.
+    
     x_scale = tl.load(xscales_ptrs + offs_m * stride_xs, mask=offs_m < M, other=0.0).to(tl.float32)
     out = acc * x_scale[:, None]
 

@@ -1,19 +1,13 @@
-"""Quantization dispatch: quant_method+bits -> adapter and compute kernel.
+"""Quantization dispatch: load-time adapters + runtime kernel router."""
 
-Mirrors the model registry in `tinyinfra/models/__init__.py`. Adding a new
-checkpoint format or bit-width is a one-line registration here.
-"""
+from tinyinfra.engine.quant.router import (
+    QuantTensor, quant_matmul, register_kernel, resolve_scheme, supported_schemes,
+)
 
-from dataclasses import dataclass
-from typing import Callable
-
-import torch
-
-_ADAPTERS: dict[tuple[str, int], Callable] = {}
+_ADAPTERS: dict[tuple[str, int], object] = {}
 
 
 def register(method: str, bits: int):
-    """Decorator: register an unpacking adapter for (quant_method, bits)."""
     def deco(fn):
         _ADAPTERS[(method, bits)] = fn
         return fn
@@ -24,7 +18,7 @@ def supported_quant() -> list[tuple[str, int]]:
     return sorted(_ADAPTERS)
 
 
-def get_adapter(method: str, bits: int) -> Callable:
+def get_adapter(method: str, bits: int):
     try:
         return _ADAPTERS[(method, bits)]
     except KeyError:
@@ -34,16 +28,5 @@ def get_adapter(method: str, bits: int) -> Callable:
         ) from None
 
 
-@dataclass
-class QuantTensor:
-    """Canonical quantized weight: plain uint8 W [K,N], fp16 scales [K/g,N], uint8 zeros."""
-    qweight: torch.Tensor   # uint8 [K, N]
-    scales: torch.Tensor    # fp16 [K//group, N]
-    zeros: torch.Tensor     # uint8 [K//group, N]
-    group: int
-    sym: bool
-    bias: torch.Tensor | None = None
-
-
-# Import adapters so they register themselves. Keep at bottom to avoid cycles.
+# Import adapters so they register themselves.
 from tinyinfra.engine.quant import gptq, compressed_tensors  # noqa: E402,F401

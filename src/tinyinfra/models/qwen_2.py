@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from tinyinfra.engine.cache_manager import KVCacheManager
 from tinyinfra.kernels.fused_mlp import fused_mlp_forward
 from tinyinfra.kernels.Paged_Attn import launch_paged_attention
+from tinyinfra.kernels.RMSNorm import fused_add_rmsnorm, rmsnorm
 from tinyinfra.kernels.Rope import rope_inplace
 from tinyinfra.models.config import QwenConfig
 
@@ -19,19 +20,7 @@ class RmsNorm(nn.Module):
         self.eps = eps
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if not isinstance(hidden_states, torch.Tensor):
-            raise TypeError(f"Expected input to be a torch.Tensor, but got {type(hidden_states)}")
-        # calculation must happen in float32 for numerical stability hence store oriiginal
-        input_dtype = hidden_states.dtype
-        # Cast to float32 for numerical stability during RMS normalization
-        hidden_states = hidden_states.to(torch.float32)
-        # Compute the variance of the hidden states along the last dimension
-        variance = hidden_states.pow(2).mean(dim=-1, keepdim=True)
-        # Normalize the hidden states using RMS normalization formula
-        hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
-        # Scale the normalized hidden states by the weight parameter
-        return self.weight * hidden_states.to(input_dtype)  # Cast back to original dtype
-
+        return rmsnorm(hidden_states, self.weight, self.eps)
 
 class Qwen2Attention(nn.Module):
     def __init__(self, config: QwenConfig):
@@ -180,13 +169,11 @@ class Qwen2DecodeLayer(nn.Module):
             hidden_states, pos_id, layer_idx, batch_indices, kv_cache, cos_cache, sin_cache
         )
 
-        # Add the residual connection to the output of self-attention
-        hidden_states = hidden_states + residual
-
-        # save a new copy of the hidden states for the next residual connection
-        residual = hidden_states
-        # Apply RMS normalization to the hidden states after self-attention
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        # Add residual and normalize in one kernel
+        hidden_states, residual = fused_add_rmsnorm(
+            hidden_states, residual, self.post_attention_layernorm.weight,
+            self.post_attention_layernorm.eps,
+        )
         # Apply the MLP to the normalized hidden states (fused down projection + residual)
         hidden_states = self.mlp(hidden_states, residual)
         return hidden_states

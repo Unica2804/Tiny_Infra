@@ -24,5 +24,13 @@ def unpack_gptq8(qweight: torch.Tensor, qzeros: torch.Tensor, scales: torch.Tens
     Z = torch.empty((qzeros.shape[0], N), dtype=torch.uint8, device=qzeros.device)
     for j in range(4):
         Z[:, j::4] = ((qzeros >> (8 * j)) & 0xFF).to(torch.uint8)
-    return QuantTensor(qweight=W, scales=scales.to(torch.float16),
+    return QuantTensor(scheme="W8A16", qweight=W, scales=scales.to(torch.float16),
                        zeros=Z.to(torch.uint8), group=group, sym=sym, bias=bias)
+
+
+@register("gptq", 4)
+def unpack_gptq4(qweight: torch.Tensor, qzeros: torch.Tensor, scales: torch.Tensor,
+                 group: int, sym: bool, bias=None) -> QuantTensor:
+    # 4-bit stays packed: qweight [K/8,N], qzeros [K/g,N/8]
+    return QuantTensor(scheme="W4A16", qweight=qweight, qzeros=qzeros,
+                       scales=scales.to(torch.float16), group=group, sym=sym, bias=bias)

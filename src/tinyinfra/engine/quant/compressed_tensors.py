@@ -31,5 +31,5 @@ def unpack_compressed_tensors8(weight_packed: torch.Tensor, weight_scale: torch.
     scales = weight_scale.T.to(torch.float16).contiguous()
     # compressed-tensors symmetric int8 uses unsigned offset form: w = (q - 128) * scale
     zeros = torch.full((1, N), 128, dtype=torch.uint8, device=W.device)
-    return QuantTensor(qweight=W, scales=scales, zeros=zeros,
+    return QuantTensor(scheme="W8A16", qweight=W, scales=scales, zeros=zeros,
                        group=K, sym=True, bias=bias)

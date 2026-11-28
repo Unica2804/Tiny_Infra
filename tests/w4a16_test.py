@@ -12,7 +12,7 @@ def make_qweights(K, N, group=128, seed=0):
     g = torch.Generator(device="cuda").manual_seed(seed)
     qw = torch.randint(0, 0x7FFFFFFF, (K // 8, N), generator=g,
                        device="cuda", dtype=torch.int32)
-    # symmetric zero point 7 in each nibble -> all 0x77777777
+    # GPTQ stores (zero_point - 1): nibble 7 means actual zp=8=2^(bits-1)
     qz = torch.full((K // group, N // 8), 0x77777777, device="cuda", dtype=torch.int32)
     sc = torch.rand(K // group, N, generator=g, device="cuda", dtype=torch.float16) * 0.01 + 0.005
     return qw, qz, sc
@@ -25,7 +25,7 @@ def dequant_reference(X, qw, qz, scales, group=128):
     for k0 in range(0, K, 128):
         kk = torch.arange(k0, min(k0 + 128, K), device="cuda")
         w = ((qw[kk // 8] >> ((kk % 8)[:, None] * 4)) & 0xF).float()
-        z = ((qz[kk // group][:, nn // 8] >> ((nn % 8)[None, :] * 4)) & 0xF).float()
+        z = (((qz[kk // group][:, nn // 8] >> ((nn % 8)[None, :] * 4)) & 0xF) + 1).float()
         acc += X[:, k0:k0 + len(kk)].float() @ ((w - z) * scales[kk // group].float())
     return acc.to(torch.float16)
 

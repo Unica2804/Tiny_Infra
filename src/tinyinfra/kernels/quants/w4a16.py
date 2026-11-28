@@ -60,7 +60,7 @@ def w4a16_kernel(
         z_each = tl.load(qz_ptrs + group_idx * stride_qzk
                          + (offs_n // 8)[None, :] * stride_qzn,
                          mask=mask_col[None, :], other=0)
-        z_i4 = ((z_each >> ((offs_n % 8)[None, :] * 4)) & 0x0F).to(tl.float16)
+        z_i4 = (((z_each >> ((offs_n % 8)[None, :] * 4)) & 0x0F) + 1).to(tl.float16)
 
         s = tl.load(scales_ptrs + group_idx * stride_sk + offs_n[None, :] * stride_sn,
                     mask=mask_col[None, :], other=0.0)          # fp16 [1,BN]
